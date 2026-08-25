@@ -10,6 +10,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $taskName = "WechatAISecretary-$Profile"
+$root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+$controlDir = Join-Path $root "runtime\control"
+$disabledMarker = Join-Path $controlDir "$Profile.disabled"
 $backgroundScript = [System.IO.Path]::GetFullPath(
     (Join-Path $PSScriptRoot "background-gateway.ps1")
 )
@@ -27,6 +30,10 @@ if (-not $Apply) {
 Import-Module ScheduledTasks -ErrorAction Stop
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($Remove) {
+    if (-not (Test-Path -LiteralPath $controlDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $controlDir | Out-Null
+    }
+    Set-Content -LiteralPath $disabledMarker -Encoding UTF8 -Value "disabled"
     if ($null -ne $existing) {
         Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
@@ -35,6 +42,13 @@ if ($Remove) {
         Write-Host "$taskName 不存在，无需移除。"
     }
     exit 0
+}
+
+if ($null -ne $existing -and $existing.State -eq "Running") {
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+}
+if (Test-Path -LiteralPath $disabledMarker -PathType Leaf) {
+    Remove-Item -LiteralPath $disabledMarker -Force
 }
 
 $engine = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source

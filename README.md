@@ -2,7 +2,7 @@
 
 这是一个独立、仅在本项目目录内运行的 Windows 版微信个人秘书。Codex 负责搭建、测试和维护代码；正式运行时，由 Hermes Agent 调用 DeepSeek API 理解非私密消息，再按安全规则操作滴答清单和本地 Obsidian。
 
-当前状态：Hermes、核心实现、82 项离线测试和两套严格环境检查均已通过；`owner` 与 `partner` 已分别完成微信扫码和滴答官方 MCP OAuth，共用同一份 DeepSeek API 配置。两人的独立 Vault/私密收件箱路径已配置，滴答现有分类与工具结构已只读核验，Inbox/Obsidian 最小映射也已确认。日常任务、普通笔记和自动判断使用 `deepseek-v4-flash`；非私密图片使用 `deepseek-v4-flash-vision-exp`；只有明确写成 `深度笔记：` 的内容才使用 `deepseek-v4-pro`。结构化任务均关闭深度思考以降低延迟和 Token。图片安全预处理、本地中文语音转写和离线 Whisper `small` 模型均已就绪；owner 的文字、图片、语音和私密 Dry Run 已验收；owner 与 partner 都已分别用专用 Inbox 测试任务完成真实创建、真实完成及两端精确回读核验。两套档案已切换为正式写入模式，并允许创建任务、写入笔记、完成任务和发送各自的本地微信提醒；两人的任务、提醒队列、Cron 和微信发送路由彼此隔离。两套档案的 08:00 今日重点、22:00 晚间复盘、后台常驻和当前用户登录自启均已启用；未安装 Windows 系统服务。
+当前状态：Hermes、核心实现、97 项离线测试和两套严格环境检查均已通过；`owner` 与 `partner` 已分别完成微信扫码和滴答官方 MCP OAuth，共用同一份 DeepSeek API 配置。两人的独立 Vault/私密收件箱路径已配置，滴答现有分类与工具结构已只读核验，Inbox/Obsidian 最小映射也已确认。日常任务、普通笔记、公开链接笔记和自动判断使用 `deepseek-v4-flash`；非私密图片使用 `deepseek-v4-flash-vision-exp`；明确的深度笔记使用 `deepseek-v4-pro`。结构化任务均关闭深度思考以降低延迟和 Token。图片安全预处理、本地中文语音转写、公开网页安全读取和离线 Whisper `small` 模型均已就绪；owner 的文字、图片、语音和私密 Dry Run 已验收；owner 与 partner 都已分别用专用 Inbox 测试任务完成真实创建、真实完成及两端精确回读核验。两套档案已切换为正式写入模式，并允许创建任务、写入笔记、完成任务和发送各自的本地微信提醒；两人的任务、提醒队列、Cron 和微信发送路由彼此隔离。两套档案的 08:00 今日重点、22:00 晚间复盘、后台自恢复常驻和当前用户登录自启均已启用；未安装 Windows 系统服务。
 
 ## 设计概览
 
@@ -36,6 +36,7 @@ flowchart LR
 - 日常任务、普通笔记和自动判断使用 `deepseek-v4-flash`；非私密图片先由 `deepseek-v4-flash-vision-exp` 做一次结构化理解；明确的 `深度笔记：` 使用 `deepseek-v4-pro`。所有这些路由都设置 `reasoning_effort: none`。
 - 图片在本地按文件真实内容校验为 JPEG、PNG、GIF 或 WebP，去除 EXIF、限制尺寸后以内联 Base64 发送；不使用 DeepSeek Files API 长期保存。每条消息最多处理 4 张、每张原文件最多 16 MiB。
 - 非私密语音只在本机用 `faster-whisper` 的 `small` 模型转写，CPU `int8` 运行；原始音频和转写步骤都不发送给 DeepSeek。转写得到的最小必要文字再按任务/笔记规则分流。
+- 链接笔记只读取一个公开 HTTP/HTTPS HTML 或纯文本页面，不使用 Cookie、不登录账号、不执行脚本；DNS、每次跳转和最终地址都必须通过地址安全检查，禁止本机、内网、非标准端口和 URL 内嵌凭证。本机代理使用的 RFC 2544 `198.18.0.0/15` fake-IP 只有在档案配置明确开启时才兼容，其他私网或保留地址仍全部拒绝。网页正文始终作为不可信资料，不能改变系统指令或调用工具。
 - 滴答工具白名单只包含查询、`create_task` 和单任务 `complete_task`。批量完成、删除、移动和自动建分类均未开放。
 - 滴答服务器仍标记为 `untrusted`。只有配置中逐个列明的只读工具免重复确认；`create_task` 需要本地映射、结构、真实模式和 `-ConfirmRealWrites`，`complete_task` 还要额外通过独立的 `-ConfirmTaskCompletion`。执行器本身会再次检查两个不同的进程授权变量，不依赖 MCP 的临时交互批准。
 - Obsidian 只追加或新建，不覆盖原文；目标路径必须保持在指定 Vault 内。
@@ -45,10 +46,11 @@ flowchart LR
 
 ```text
 wechat-ai-secretary/
+├─ .github/workflows/                  # 无秘密值的自动测试与凭证扫描
 ├─ .hermes/plugins/wechat-secretary/  # Hermes 项目级插件入口
 ├─ config/                             # 安全配置示例与本地 Dry Run 配置
-├─ scripts/                            # 安装、授权、启动、停止、状态、Cron
-├─ src/wechat_secretary/               # 路由、执行器、幂等、提醒调度
+├─ scripts/                            # 安装、授权、状态、备份、后台与 Cron
+├─ src/wechat_secretary/               # 路由、执行器、网页安全读取、幂等与提醒
 ├─ tests/                              # 离线测试与 Dry Run 消息
 └─ runtime/                            # 两套 Hermes、OAuth、SQLite、日志；整体被 Git 忽略
 ```
@@ -73,6 +75,15 @@ wechat-ai-secretary/
 - 混合消息的 `task_create`、`note_write`、`reminder_create` 分别记账。部分失败时，相同微信消息 ID 的安全重试只重跑明确失败的步骤；已成功步骤不会重复。
 - 微信回复使用热情、温柔、大方且简洁的本地固定话术，不使用夸张语气或额外寒暄，也不增加模型调用。正式模式静默等待核验，只发送一次“已为你创建好/妥善保存/完成”的最终结果；失败或需要澄清时温和、明确地说明原因。单次结果在 2000 字符内保留为一个带换行的气泡；只有超长内容才拆分。
 - Dry Run 以“Dry Run｜已为你整理好模拟结果”开头，只显示人类可读结果，不显示 JSON、工具参数或内部 ID，也不使用“已创建”冒充真实成功。
+
+### 公开链接笔记
+
+- `帮我记一下这个链接：https://...`、`整理一下 https://...`：读取公开网页后使用 Flash 保存普通笔记。
+- `深度笔记：https://...`、`深入分析这个链接：https://...`、`详细研究 https://...`：读取后使用 Pro 保存深度笔记。只有明确出现这些深度表达才升级模型。
+- 只发送网址时不会立刻联网；系统会要求把选择和链接放在同一条消息中重发。一次只整理一个链接。
+- 笔记正文固定附上网页标题、最终来源网址和读取时间；网页无法读取、模型结果不可靠或写入失败时明确回复原因，不冒充成功。
+- `私密：https://...` 只按私密内容在本地保存原消息，绝不联网打开该网址。
+- 可以发送 `帮助` 或 `秘书状态` 获取本地固定说明，不调用模型、不增加 API Token。
 
 ### 完成任务
 
@@ -123,6 +134,7 @@ python -m unittest discover -s tests -v
 - 普通图片由 Vision 一次完成看图与结构化判断。DeepSeek 官方当前规则下，每张图片视觉输入最高约 384 token；本项目再限制为每条最多 4 张。
 - 普通笔记仍使用 Flash；只有明确 `深度笔记：` 才使用 Pro。带图深度笔记需要 Vision + Pro 两次调用，但原图只发送给 Vision 一次。
 - 语音模型在本地运行；只有非私密语音的转写文字会按最小必要原则进入 Flash/Pro。私密语音不做本地转写，也不进入 DeepSeek。
+- 链接读取本身不使用模型 Token；提取后的正文最多保留 18000 字符，再由 Flash 或 Pro 整理。普通链接使用 Flash，只有明确深度表达才使用 Pro。
 
 ## 本机授权：不要把凭证发到聊天
 
@@ -248,6 +260,27 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 
 后台入口会为对应档案保留已经单独确认的微信回复、真实写入、任务完成和本地提醒权限。`owner` 与 `partner` 始终使用各自独立的进程、状态库和发送路由。
 
+后台监督器只记录固定的启动、退出、异常类型和停用事件，不记录微信正文、网页正文、ID 或凭证；日志在 `runtime/logs/<profile>` 内按 1 MiB 轮转。网关异常退出后会以最长 5 分钟退避持续恢复，Windows 计划任务本身仍保留额外重启保护。执行 `stop.ps1 -ConfirmStop` 会写入当前档案的停用标记，因此不会被监督器立即拉起；重新执行 `configure-autostart.ps1 -Apply -StartNow` 才恢复后台。
+
+## 项目内加密备份
+
+备份工具只处理当前项目内对应档案的本地配置、SQLite 一致性快照和 Hermes 授权状态，不读取项目外的 Vault，也不生成明文临时压缩包。输出由 Windows DPAPI 按当前 Windows 用户加密，两套档案分别保存，默认保留最近 7 份：
+
+```powershell
+# 预览
+.\scripts\backup-profile.ps1 -Profile owner
+.\scripts\backup-profile.ps1 -Profile partner
+
+# 明确创建
+.\scripts\backup-profile.ps1 -Profile owner -Apply
+.\scripts\backup-profile.ps1 -Profile partner -Apply
+
+# 验证指定加密包，只在内存中解密检查，不解压、不显示内容
+.\scripts\backup-profile.ps1 -Profile owner -VerifyArchive "runtime\backups\owner\owner-时间.wasbak"
+```
+
+DPAPI 备份只能由相应的 Windows 用户环境解密。Vault 位于项目外，仍应使用你单独确认的加密备份方案；本工具不会越界读取或复制。
+
 ## 08:00 与 22:00 Cron
 
 两套档案目前都已创建各自独立的 08:00 今日重点和 22:00 晚间复盘。需要幂等复核或重建时，可从对应档案的本地状态安全读取已验证路由；路由值不会回显：
@@ -263,7 +296,7 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 
 - 如果滴答 OAuth 报 `metadata issuer mismatch` 且错误两端只差末尾 `/`，先确认两个 Hermes 配置都保留 `issuer_trailing_slash_compat_host: dida365.com`，再重新运行对应档案的 `-AuthorizeDida`。其他主机、协议或路径不一致仍应停止，不要扩大兼容范围。
 - 外部写调用中断时不要立即重发原消息；先在滴答或 Vault 核对。状态为 `uncertain` 的操作不会自动重试。
-- 真实运行前可在两个网关停止后分别备份 `runtime/state/owner`、`runtime/state/partner`、`runtime/hermes-home` 与 `runtime/hermes-home-partner`。后两者含凭证，备份必须放在你控制的加密位置。
+- 可用 `backup-profile.ps1` 分别创建并验证项目内 DPAPI 加密备份；不要把解密后的授权状态复制给另一位用户。
 - SQLite 保存操作结果、task ID、任务标题、微信路由、提醒时间和状态，但不保存普通入站消息正文。私密正文只存在你指定的私密收件箱。
 - 如果 SQLite 损坏，先停止网关并复制原文件留证，不要删除或重建；依据滴答和 Vault 现状人工恢复，避免重复副作用。
 - OAuth 失效时，用正确的 `-Profile owner` 或 `-Profile partner` 重新运行 `scripts/setup-auth.ps1 -AuthorizeDida`，成功后只重启对应网关。
@@ -273,8 +306,13 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 - 图片、语音、私密链路、真实滴答写入、Obsidian 写入、任务完成和两端独立提醒均已完成验收。
 - GIF 只分析第一帧；视觉结果不能保证精确识别极小文字，关键日期、金额或任务对象不明确时会要求确认。语音环境噪声较大或转写置信度不足时同样不会猜测执行。
 - “私密：”如果只在语音里说出，系统必须先做本地 ASR 才能知道该前缀，因此会拒绝继续处理；要保证连本地 ASR 都不运行，请在发送媒体前先发“私密：下一条”。
+- 链接笔记只支持公开 HTML、XHTML 和纯文本页面；登录页、付费墙、需要 Cookie 的页面、PDF、文件下载及大多数强依赖 JavaScript 的页面会明确拒绝或提示改发截图。
 - 实际创建和完成仍保留结构验证、精确回读、幂等及失败不冒充成功等安全闸门。
 - Windows 后台常驻和当前用户登录自启已通过独立计划任务启用；未安装 Windows 系统服务，未登录该用户前不会运行。
+
+## 自动检查
+
+GitHub 私有仓库每次推送或发起拉取请求时，使用 Windows runner 安装锁定的 Hermes 版本，执行仓库凭证扫描、全部 PowerShell 语法检查、Python 编译、97 项离线测试以及仅使用合成数据的 DPAPI 备份自检。工作流权限仅为读取仓库内容，不持久化检出凭证，也不使用项目 API Key。
 
 ## 官方资料
 

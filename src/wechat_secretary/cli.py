@@ -135,6 +135,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     )
     print(f"Obsidian 映射：{'已确认' if settings.obsidian_mapping_confirmed else '未确认'}")
     print(f"本地微信提醒：{'已启用' if settings.reminders_enabled else '未启用'}")
+    print(f"公开链接笔记：{'已启用' if settings.web_enabled else '未启用'}")
     pillow_found = importlib.util.find_spec("PIL") is not None
     whisper_found = importlib.util.find_spec("faster_whisper") is not None
     silk_found = importlib.util.find_spec("pysilk") is not None
@@ -169,7 +170,10 @@ def command_doctor(args: argparse.Namespace) -> int:
         f"Whisper {settings.asr_model} 模型："
         f"{'已完整缓存' if whisper_cache_ready else '尚未完整缓存'}"
     )
-    errors = settings.runtime_errors(strict=args.strict)
+    errors = settings.runtime_errors(
+        strict=args.strict,
+        require_write_approval=args.strict,
+    )
     if args.strict and not os.getenv("DEEPSEEK_API_KEY"):
         errors.append("DeepSeek Key 未配置；请仅在本机授权向导中设置")
     if args.strict and not hermes_found:

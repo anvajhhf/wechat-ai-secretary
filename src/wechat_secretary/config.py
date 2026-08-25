@@ -72,6 +72,13 @@ class SecretarySettings:
     media_text_max_chars: int = 12000
     asr_model: str = "small"
     asr_language: str = "zh"
+    web_enabled: bool = False
+    web_max_urls: int = 1
+    web_max_bytes: int = 2 * 1024 * 1024
+    web_max_text_chars: int = 18000
+    web_timeout_seconds: int = 15
+    web_max_redirects: int = 3
+    web_allow_proxy_fake_ip: bool = False
     dida_server: str = "dida365"
     dida_mapping_confirmed: bool = False
     dida_schema_confirmed: bool = False
@@ -136,7 +143,12 @@ class SecretarySettings:
             private_inbox_path=private_inbox,
         )
 
-    def runtime_errors(self, strict: bool = False) -> list[str]:
+    def runtime_errors(
+        self,
+        strict: bool = False,
+        *,
+        require_write_approval: bool = True,
+    ) -> list[str]:
         errors: list[str] = []
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", self.profile_id):
             errors.append("profile_id 只能包含小写字母、数字、下划线或连字符")
@@ -160,7 +172,10 @@ class SecretarySettings:
                 errors.append("滴答清单分类映射尚未确认")
             if not self.dida_schema_confirmed:
                 errors.append("滴答 MCP create_task 尚未通过专用测试任务创建并回读确认")
-            if os.getenv("SECRETARY_DIDA_CREATES_APPROVED", "").strip() != "1":
+            if (
+                require_write_approval
+                and os.getenv("SECRETARY_DIDA_CREATES_APPROVED", "").strip() != "1"
+            ):
                 errors.append("本次前台启动尚未显式允许创建滴答任务")
             if (
                 os.getenv("SECRETARY_DIDA_COMPLETIONS_APPROVED", "").strip() == "1"
@@ -180,6 +195,7 @@ class SecretarySettings:
         wechat = data.get("wechat", {})
         obsidian = data.get("obsidian", {})
         media = data.get("media", {})
+        web = data.get("web", {})
         reminders = data.get("reminders", {})
         dida = data.get("dida", {})
 
@@ -259,6 +275,24 @@ class SecretarySettings:
             ),
             asr_model=str(media.get("asr_model", "small")).strip() or "small",
             asr_language=str(media.get("asr_language", "zh")).strip() or "zh",
+            web_enabled=_as_bool(web.get("enabled"), False),
+            web_max_urls=max(1, min(int(web.get("max_urls", 1)), 2)),
+            web_max_bytes=max(
+                256 * 1024,
+                min(int(web.get("max_bytes", 2 * 1024 * 1024)), 4 * 1024 * 1024),
+            ),
+            web_max_text_chars=max(
+                2000, min(int(web.get("max_text_chars", 18000)), 30000)
+            ),
+            web_timeout_seconds=max(
+                5, min(int(web.get("timeout_seconds", 15)), 30)
+            ),
+            web_max_redirects=max(
+                0, min(int(web.get("max_redirects", 3)), 5)
+            ),
+            web_allow_proxy_fake_ip=_as_bool(
+                web.get("allow_proxy_fake_ip"), False
+            ),
             dida_server=str(dida.get("server", "dida365")).strip() or "dida365",
             dida_mapping_confirmed=_as_bool(dida.get("mapping_confirmed"), False),
             dida_schema_confirmed=_as_bool(dida.get("schema_confirmed"), False),

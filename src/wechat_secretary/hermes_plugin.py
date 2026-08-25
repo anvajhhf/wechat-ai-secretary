@@ -21,6 +21,7 @@ from .private_inbox import PrivateInboxExecutor
 from .reminders import ReminderScheduler
 from .replies import add_dry_run_previews
 from .service import SecretaryService
+from .web_reader import SafeWebReader
 
 
 logger = logging.getLogger(__name__)
@@ -320,6 +321,7 @@ def register(ctx: Any) -> None:
             obsidian=ObsidianExecutor(settings),
             private_inbox=PrivateInboxExecutor(settings),
             media=LocalMediaPreprocessor(settings),
+            web=SafeWebReader(settings),
         )
         scheduler = ReminderScheduler(settings, ledger)
         bridge = GatewayBridge(service, scheduler)

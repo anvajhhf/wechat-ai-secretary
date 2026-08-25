@@ -1,0 +1,63 @@
+name: project-checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Scan tracked files without printing contents
+        shell: pwsh
+        run: .\scripts\check-repository-secrets.ps1
+
+      - name: Install pinned local runtime
+        shell: pwsh
+        run: .\scripts\install-local.ps1
+
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: |
+          $errors = @()
+          foreach ($file in Get-ChildItem -LiteralPath scripts -Filter *.ps1 -File) {
+            $tokens = $null
+            $parseErrors = $null
+            [void][Management.Automation.Language.Parser]::ParseFile(
+              $file.FullName,
+              [ref]$tokens,
+              [ref]$parseErrors
+            )
+            $errors += $parseErrors
+          }
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+
+      - name: Run offline tests
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src;runtime/hermes-agent"
+          .\.venv\Scripts\python.exe -m compileall -q src
+          .\.venv\Scripts\python.exe -m unittest discover -s tests -v
+
+      - name: Verify encrypted backup container with synthetic data
+        shell: pwsh
+        run: |
+          .\scripts\backup-profile.ps1 -Profile owner -SelfTest
+          .\scripts\backup-profile.ps1 -Profile partner -SelfTest

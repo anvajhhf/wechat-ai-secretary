@@ -48,6 +48,14 @@ from wechat_secretary.private_inbox import PrivateInboxExecutor
 from wechat_secretary.reminders import ReminderQueue, ReminderScheduler
 from wechat_secretary.replies import add_dry_run_previews, format_results
 from wechat_secretary.service import SecretaryService
+from wechat_secretary.web_reader import (
+    FetchResponse,
+    LinkNoteMode,
+    SafeWebReader,
+    WebPage,
+    WebReadError,
+    decide_link_note,
+)
 from tools.mcp_oauth_manager import _normalize_root_issuer_trailing_slash
 from tools.mcp_tool import (
     _operator_approved_tools,
@@ -106,6 +114,7 @@ def service_with(
     obsidian: object | None = None,
     private_inbox: object | None = None,
     media: object | None = None,
+    web: object | None = None,
 ) -> tuple[SecretaryService, object, IdempotencyLedger]:
     cfg = cfg or settings()
     ledger = ledger or IdempotencyLedger(":memory:")
@@ -119,6 +128,7 @@ def service_with(
         private_inbox=private_inbox or PrivateInboxExecutor(cfg),
         reminders=ReminderQueue(cfg, ledger),
         media=media,
+        web=web,
     )
     return app, classifier, ledger
 
@@ -288,6 +298,305 @@ class RoutingTests(unittest.TestCase):
                 datetime.fromisoformat("2026-08-24T09:30:00+08:00"),
             ),
         )
+
+
+class WebLinkNoteTests(unittest.TestCase):
+    class CapturingClassifier:
+        def __init__(self) -> None:
+            self.call_count = 0
+            self.content = ""
+            self.forced_kind: IntentKind | None = None
+            self.deep_note = False
+
+        def classify(
+            self,
+            incoming: MessageEnvelope,
+            content: str,
+            forced_kind: IntentKind | None,
+            categories: object,
+            links: object,
+            *,
+            deep_note: bool = False,
+            image_inputs: object = (),
+        ) -> IntentPlan:
+            del incoming, categories, links, image_inputs
+            self.call_count += 1
+            self.content = content
+            self.forced_kind = forced_kind
+            self.deep_note = deep_note
+            if forced_kind is IntentKind.TASK:
+                return IntentPlan(
+                    kind=IntentKind.TASK,
+                    tasks=(TaskDraft("阅读公开链接"),),
+                    confidence=0.95,
+                )
+            return IntentPlan(
+                kind=IntentKind.NOTE,
+                notes=(NoteDraft("网页要点", "客观整理后的正文", "简短摘要"),),
+                confidence=0.95,
+            )
+
+    class StaticWeb:
+        def __init__(self, error: str = "") -> None:
+            self.calls: list[str] = []
+            self.error = error
+
+        def read(self, url: str) -> WebPage:
+            self.calls.append(url)
+            if self.error:
+                raise WebReadError(self.error)
+            return WebPage(
+                source_url=url,
+                final_url="https://example.com/article",
+                title="公开文章",
+                text="这是一段足够长的公开网页正文，用于验证链接笔记整理功能。",
+            )
+
+    def test_plain_url_asks_for_mode_without_fetch_or_model(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb()
+        app, _, _ = service_with(
+            settings(web_enabled=True), classifier=classifier, web=web
+        )
+
+        result = app.handle(message("web-plain", "https://example.com/article"))
+
+        self.assertEqual(ExecutionStatus.SKIPPED, result.status)
+        self.assertIn("选择和链接一起重发", result.reply)
+        self.assertEqual([], web.calls)
+        self.assertEqual(0, classifier.call_count)
+
+    def test_normal_link_note_fetches_once_and_uses_flash_route(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb()
+        app, _, _ = service_with(
+            settings(web_enabled=True), classifier=classifier, web=web
+        )
+
+        result = app.handle(
+            message("web-note", "帮我记一下这个链接：https://example.com/source")
+        )
+
+        self.assertEqual(ExecutionStatus.PLANNED, result.status)
+        self.assertEqual(["https://example.com/source"], web.calls)
+        self.assertEqual(IntentKind.NOTE, classifier.forced_kind)
+        self.assertFalse(classifier.deep_note)
+        self.assertIn("公开网页资料", classifier.content)
+        self.assertIn("这是一段足够长", classifier.content)
+        self.assertIn("https://example.com/article", result.results[0].preview)
+
+    def test_deep_link_note_requires_explicit_deep_wording(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb()
+        app, _, _ = service_with(
+            settings(web_enabled=True), classifier=classifier, web=web
+        )
+
+        result = app.handle(
+            message("web-deep", "深入分析这个链接：https://example.com/source")
+        )
+
+        self.assertEqual(ExecutionStatus.PLANNED, result.status)
+        self.assertTrue(classifier.deep_note)
+        self.assertEqual(IntentKind.NOTE, classifier.forced_kind)
+
+    def test_explicit_deep_note_prefix_routes_webpage_to_deep_model(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb()
+        app, _, _ = service_with(
+            settings(web_enabled=True), classifier=classifier, web=web
+        )
+
+        result = app.handle(
+            message("web-deep-prefix", "深度笔记：https://example.com/source")
+        )
+
+        self.assertEqual(ExecutionStatus.PLANNED, result.status)
+        self.assertTrue(classifier.deep_note)
+        self.assertEqual(1, classifier.call_count)
+
+    def test_task_containing_url_never_fetches_webpage(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb()
+        app, _, _ = service_with(
+            settings(web_enabled=True), classifier=classifier, web=web
+        )
+
+        result = app.handle(
+            message("web-task", "待办：明天阅读 https://example.com/article")
+        )
+
+        self.assertEqual(ExecutionStatus.PLANNED, result.status)
+        self.assertEqual([], web.calls)
+        self.assertEqual(IntentKind.TASK, classifier.forced_kind)
+
+    def test_private_url_never_fetches_or_calls_model(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb(error="不应调用")
+        app, _, _ = service_with(
+            settings(web_enabled=True), classifier=classifier, web=web
+        )
+
+        result = app.handle(
+            message("web-private", "私密：https://example.com/private")
+        )
+
+        self.assertEqual(ExecutionStatus.PLANNED, result.status)
+        self.assertEqual([], web.calls)
+        self.assertEqual(0, classifier.call_count)
+
+    def test_multiple_link_note_is_refused_before_fetch(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb()
+        app, _, _ = service_with(
+            settings(web_enabled=True, web_max_urls=1), classifier=classifier, web=web
+        )
+
+        result = app.handle(
+            message(
+                "web-many",
+                "整理一下 https://example.com/one 和 https://example.com/two",
+            )
+        )
+
+        self.assertEqual(ExecutionStatus.SKIPPED, result.status)
+        self.assertIn("每次只发送 1 个链接", result.reply)
+        self.assertEqual([], web.calls)
+        self.assertEqual(0, classifier.call_count)
+
+    def test_web_failure_is_explicit_and_never_saves_note(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb(error="网页返回 HTTP 403")
+        app, _, _ = service_with(
+            settings(web_enabled=True), classifier=classifier, web=web
+        )
+
+        result = app.handle(
+            message("web-failure", "帮我记一下 https://example.com/blocked")
+        )
+
+        self.assertEqual(ExecutionStatus.FAILED, result.status)
+        self.assertIn("HTTP 403", result.reply)
+        self.assertIn("没有保存笔记", result.reply)
+        self.assertFalse(result.results)
+        self.assertEqual(0, classifier.call_count)
+
+    def test_local_help_and_status_do_not_call_model(self) -> None:
+        classifier = self.CapturingClassifier()
+        app, _, _ = service_with(
+            settings(web_enabled=True, reminders_enabled=True), classifier=classifier
+        )
+
+        help_result = app.handle(message("local-help", "帮助"))
+        status_result = app.handle(message("local-status", "秘书状态"))
+
+        self.assertIn("读取公开链接", help_result.reply)
+        self.assertIn("链接笔记已启用", status_result.reply)
+        self.assertEqual(0, classifier.call_count)
+
+
+class SafeWebReaderTests(unittest.TestCase):
+    PUBLIC_IP = "93.184.216.34"
+
+    def test_link_mode_is_deep_only_for_explicit_deep_wording(self) -> None:
+        normal = decide_link_note(
+            "帮我整理一下 https://example.com/a", None, False
+        )
+        deep = decide_link_note(
+            "详细研究 https://example.com/a", None, False
+        )
+        task = decide_link_note(
+            "待办：https://example.com/a", IntentKind.TASK, False
+        )
+        self.assertEqual(LinkNoteMode.NORMAL, normal.mode)
+        self.assertEqual(LinkNoteMode.DEEP, deep.mode)
+        self.assertEqual(LinkNoteMode.NONE, task.mode)
+
+    def test_private_and_nonstandard_targets_are_blocked(self) -> None:
+        cfg = settings(web_enabled=True)
+        reader = SafeWebReader(
+            cfg,
+            resolver=lambda host, port: ("127.0.0.1",),
+            requester=lambda *args: self.fail("不应发起请求"),
+        )
+        blocked = (
+            "http://127.0.0.1/secret",
+            "http://example.com:8080/",
+            "https://" + "user" + ":" + "password" + "@example.com/",
+            "file:///etc/passwd",
+        )
+        for index, url in enumerate(blocked):
+            with self.subTest(index=index), self.assertRaises(WebReadError):
+                reader.read(url)
+
+    def test_html_reader_removes_scripts_and_keeps_source(self) -> None:
+        body = """
+        <html><head><title>测试文章</title><script>恶意指令</script></head>
+        <body><h1>公开标题</h1><p>这是用于测试的公开正文，内容足够长。</p>
+        <style>隐藏样式</style><p>第二段客观内容。</p></body></html>
+        """.encode()
+        cfg = settings(web_enabled=True)
+        reader = SafeWebReader(
+            cfg,
+            resolver=lambda host, port: (self.PUBLIC_IP,),
+            requester=lambda url, addresses, max_bytes, timeout: FetchResponse(
+                200,
+                {"content-type": "text/html; charset=utf-8"},
+                body,
+            ),
+        )
+
+        page = reader.read("https://example.com/article#fragment")
+
+        self.assertEqual("测试文章", page.title)
+        self.assertIn("公开标题", page.text)
+        self.assertIn("第二段客观内容", page.text)
+        self.assertNotIn("恶意指令", page.text)
+        self.assertNotIn("隐藏样式", page.text)
+        self.assertEqual("https://example.com/article", page.final_url)
+
+    def test_proxy_fake_ip_is_allowed_only_by_explicit_setting(self) -> None:
+        body = b"public text body long enough for the safe reader test"
+        response = lambda url, addresses, max_bytes, timeout: FetchResponse(
+            200,
+            {"content-type": "text/plain; charset=utf-8"},
+            body,
+        )
+        denied = SafeWebReader(
+            settings(web_enabled=True, web_allow_proxy_fake_ip=False),
+            resolver=lambda host, port: ("198.18.0.10",),
+            requester=response,
+        )
+        allowed = SafeWebReader(
+            settings(web_enabled=True, web_allow_proxy_fake_ip=True),
+            resolver=lambda host, port: ("198.18.0.10",),
+            requester=response,
+        )
+
+        with self.assertRaises(WebReadError):
+            denied.read("https://example.com/")
+        page = allowed.read("https://example.com/")
+        self.assertIn("public text body", page.text)
+
+    def test_redirect_is_revalidated_and_cannot_reach_private_ip(self) -> None:
+        cfg = settings(web_enabled=True)
+
+        def resolver(host: str, port: int) -> tuple[str, ...]:
+            del port
+            return ("127.0.0.1",) if host == "localhost" else (self.PUBLIC_IP,)
+
+        reader = SafeWebReader(
+            cfg,
+            resolver=resolver,
+            requester=lambda url, addresses, max_bytes, timeout: FetchResponse(
+                302,
+                {"location": "http://localhost/private"},
+                b"",
+            ),
+        )
+
+        with self.assertRaises(WebReadError):
+            reader.read("https://example.com/redirect")
 
 
 class MediaRoutingTests(unittest.TestCase):
@@ -1066,6 +1375,15 @@ class ConfigSafetyTests(unittest.TestCase):
             self.assertFalse(
                 any("允许创建" in error for error in cfg.runtime_errors(strict=True))
             )
+
+    def test_read_only_status_does_not_report_missing_process_approval(self) -> None:
+        cfg = self.real_settings()
+        with patch.dict(os.environ, {}, clear=True):
+            errors = cfg.runtime_errors(
+                strict=False,
+                require_write_approval=False,
+            )
+        self.assertFalse(any("本次前台启动" in error for error in errors))
 
     def test_completion_approval_requires_confirmed_completion_schema(self) -> None:
         cfg = self.real_settings(dida_complete_schema_confirmed=False)
