@@ -1091,11 +1091,34 @@ class ProfileIsolationTests(unittest.TestCase):
             owner_ledger.close()
             partner_ledger.close()
 
-    def test_local_profile_configs_point_to_separate_data_roots(self) -> None:
-        owner = SecretarySettings.from_file(ROOT / "config" / "secretary.toml", ROOT)
-        partner = SecretarySettings.from_file(
-            ROOT / "config" / "secretary.partner.toml", ROOT
-        )
+    def test_profile_configs_point_to_separate_data_roots(self) -> None:
+        root = test_directory("profile-configs")
+
+        def write_profile(profile_id: str) -> Path:
+            config_path = root / f"{profile_id}.toml"
+            config_path.write_text(
+                "\n".join(
+                    (
+                        "[secretary]",
+                        f'profile_id = "{profile_id}"',
+                        "",
+                        "[obsidian]",
+                        f'vault_path = "vault-{profile_id}"',
+                        f'private_inbox_path = "private-{profile_id}.jsonl"',
+                        "",
+                        "[media]",
+                        f'allowed_cache_roots = ["runtime/hermes-home-{profile_id}/cache"]',
+                        "",
+                        "[reminders]",
+                        "enabled = true",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            return config_path
+
+        owner = SecretarySettings.from_file(write_profile("owner"), root)
+        partner = SecretarySettings.from_file(write_profile("partner"), root)
         self.assertEqual("owner", owner.profile_id)
         self.assertEqual("partner", partner.profile_id)
         self.assertTrue(owner.reminders_enabled)
