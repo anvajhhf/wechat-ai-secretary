@@ -45,7 +45,9 @@ def _success_line(result: ActionResult, dry_run: bool) -> str:
     if result.action == "task":
         return f"已为你创建好任务：{result.summary}｜{result.destination or 'Inbox'}"
     if result.action == "note":
-        return f"已为你妥善保存笔记：{result.destination}"
+        saved = f"已为你妥善保存笔记：{result.destination}"
+        details = _note_preview_lines(result.preview)
+        return "\n".join((saved, *details)) if details else saved
     if result.action == "private":
         return "已为你在本地保存私密内容"
     if result.action == "query":

@@ -2508,13 +2508,20 @@ class DryRunCliTests(unittest.TestCase):
                     ExecutionStatus.SUCCEEDED,
                     "产品想法",
                     destination="Inbox/微信收件箱.md",
+                    preview=(
+                        "## 产品想法\n\n"
+                        "> 摘要：记录一项经过整理的产品改进建议。\n\n"
+                        "标签：#产品"
+                    ),
                 ),
             ),
             dry_run=False,
         )
         self.assertEqual(
             "已为你创建好任务：提交报告｜Inbox\n"
-            "已为你妥善保存笔记：Inbox/微信收件箱.md",
+            "已为你妥善保存笔记：Inbox/微信收件箱.md\n"
+            "摘要：记录一项经过整理的产品改进建议。\n"
+            "标签：#产品",
             rendered,
         )
         self.assertNotIn("准备", rendered)
@@ -2708,6 +2715,7 @@ class ObsidianSafetyTests(unittest.TestCase):
         body = target.read_text(encoding="utf-8")
         self.assertEqual(ExecutionStatus.SUCCEEDED, first.status)
         self.assertEqual(ExecutionStatus.SKIPPED, second.status)
+        self.assertIn("内容：新增正文", format_results((first,), dry_run=False))
         self.assertTrue(body.startswith("原有内容\n"))
         self.assertEqual(1, body.count("新增正文"))
 

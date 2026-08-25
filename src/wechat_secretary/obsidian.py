@@ -133,6 +133,10 @@ class ObsidianExecutor:
                 summary=note.title,
                 destination=destination,
                 external_id=ref,
+                # Keep the rendered note only in this in-memory result so the
+                # verified reply can describe what was saved. The ledger
+                # deliberately discards previews instead of persisting them.
+                preview=rendered,
             )
         except Exception as exc:
             return ActionResult(
