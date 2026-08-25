@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechat-ai-secretary"
+version = "0.1.0"
+description = "本机运行的 Hermes + DeepSeek 微信个人秘书"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "Pillow>=11.3,<13",
+  "tzdata>=2025.3; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+media = [
+  "faster-whisper>=1.2.1,<2",
+  "silk-python>=0.2.8,<0.3",
+]
+
+[project.scripts]
+wechat-secretary = "wechat_secretary.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

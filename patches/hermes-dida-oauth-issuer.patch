@@ -1,0 +1,103 @@
+diff --git a/tools/mcp_oauth_manager.py b/tools/mcp_oauth_manager.py
+--- a/tools/mcp_oauth_manager.py
++++ b/tools/mcp_oauth_manager.py
+@@ -65,6 +65,37 @@ def _same_endpoint(a: str, b: str) -> bool:
+     )
+ 
+ 
++def _normalize_root_issuer_trailing_slash(
++    value: str | None,
++    allowed_host: str,
++) -> str | None:
++    """Strip only a root-path slash for an explicitly allowlisted HTTPS host.
++
++    Some authorization servers publish ``https://host/`` in protected-resource
++    metadata but ``https://host`` as the authorization metadata issuer.  The
++    MCP SDK correctly performs an exact RFC 8414 comparison, so that provider
++    defect otherwise blocks OAuth.  This helper deliberately does *not*
++    normalize paths, ports, schemes, userinfo, queries, fragments, or hosts.
++    """
++    if not value or not allowed_host:
++        return value
++    from urllib.parse import urlsplit, urlunsplit
++
++    try:
++        parsed = urlsplit(value)
++    except ValueError:
++        return value
++    if (
++        parsed.scheme.lower() != "https"
++        or parsed.netloc.lower() != allowed_host.strip().lower()
++        or parsed.path != "/"
++        or parsed.query
++        or parsed.fragment
++    ):
++        return value
++    return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
++
++
+ # ---------------------------------------------------------------------------
+ # Per-server entry
+ # ---------------------------------------------------------------------------
+@@ -135,6 +166,7 @@ def _make_hermes_provider_class() -> Optional[type]:
+             server_name: str = "",
+             preregistered: bool = False,
+             token_user_agent: "str | None" = None,
++            issuer_trailing_slash_compat_host: str = "",
+             **kwargs: Any,
+         ):
+             super().__init__(*args, **kwargs)
+@@ -149,6 +181,24 @@ def _make_hermes_provider_class() -> Optional[type]:
+             # oauth.user_agent — stamped onto token-endpoint requests only;
+             # some authorization servers/WAFs reject httpx's default (#75576).
+             self._hermes_token_user_agent = token_user_agent
++            # Opt-in, host-pinned compatibility for providers whose PRM and
++            # authorization metadata disagree only on the root trailing slash.
++            self._hermes_issuer_trailing_slash_compat_host = (
++                issuer_trailing_slash_compat_host.strip().lower()
++            )
++
++        def _apply_issuer_trailing_slash_compat(self) -> None:
++            current = getattr(self.context, "auth_server_url", None)
++            normalized = _normalize_root_issuer_trailing_slash(
++                current,
++                self._hermes_issuer_trailing_slash_compat_host,
++            )
++            if normalized != current:
++                self.context.auth_server_url = normalized
++                logger.debug(
++                    "MCP OAuth '%s': normalized allowlisted root issuer slash",
++                    self._hermes_server_name,
++                )
+ 
+         def _stamp_token_user_agent(self, request):
+             ua = getattr(self, "_hermes_token_user_agent", None)
+@@ -530,15 +580,18 @@ def _make_hermes_provider_class() -> Optional[type]:
+             # generator via inner.asend(incoming), preserving the bidirectional
+             # contract. Regression from PR #11383 caught by
+             # tests/tools/test_mcp_oauth_bidirectional.py.
++            self._apply_issuer_trailing_slash_compat()
+             inner = super().async_auth_flow(request)
+             try:
+                 outgoing = await inner.__anext__()
++                self._apply_issuer_trailing_slash_compat()
+                 while True:
+                     incoming = yield outgoing
+                     # Sniff the response for a dead-client-registration signal
+                     # before handing it back to the SDK (best-effort, GH#36767).
+                     await self._maybe_flag_poisoned_client(incoming)
+                     outgoing = await inner.asend(incoming)
++                    self._apply_issuer_trailing_slash_compat()
+             except StopAsyncIteration:
+                 # Persist any metadata the SDK discovered lazily during the
+                 # 401 branch so a subsequent cold-load skips discovery.
+@@ -706,6 +759,9 @@ class MCPOAuthManager:
+             redirect_handler=redirect_handler,
+             callback_handler=callback_handler,
+             token_user_agent=token_request_user_agent(cfg),
++            issuer_trailing_slash_compat_host=str(
++                cfg.get("issuer_trailing_slash_compat_host", "")
++            ),
+             **cimd_provider_kwargs(cfg),
+         )
+ 

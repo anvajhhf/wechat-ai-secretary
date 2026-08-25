@@ -1,0 +1,91 @@
+diff --git a/tools/mcp_tool.py b/tools/mcp_tool.py
+index 08b15dc..062a113 100644
+--- a/tools/mcp_tool.py
++++ b/tools/mcp_tool.py
+@@ -4334,6 +4334,8 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
+ # byte-stable and prompt caching is preserved.
+ _server_trust_levels: Dict[str, str] = {}
+ _tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
++_operator_approved_tools: Dict[str, set[str]] = {}
++_operator_approved_tools_when_env: Dict[str, Dict[str, set[str]]] = {}
+ 
+ _TRUST_FULL = "full"
+ _TRUST_UNTRUSTED = "untrusted"
+@@ -4381,16 +4383,62 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
+ def _record_tool_trust_metadata(
+     server_name: str, config: dict, tools: List[Any]
+ ) -> None:
+-    """Capture per-server trust and per-tool readOnlyHint at discovery."""
++    """Capture trust metadata and exact operator-approved names at discovery.
++
++    ``operator_approved_tools`` is an opt-in local configuration list.  It is
++    intentionally exact-name based and intersected with the tools discovered
++    from this server, so a typo or stale name never broadens access.
++    """
+     with _lock:
+         _server_trust_levels[server_name] = _normalize_server_trust(
+             (config or {}).get("trust")
+         )
+         hints = _tool_read_only_hints.setdefault(server_name, {})
++        discovered_names: set[str] = set()
+         for tool in tools:
+             name = getattr(tool, "name", None)
+             if name:
++                discovered_names.add(name)
+                 hints[name] = _annotation_read_only_hint(tool)
++        configured = (config or {}).get("operator_approved_tools", [])
++        if not isinstance(configured, list):
++            logger.warning(
++                "MCP trust: %s.operator_approved_tools must be a list; "
++                "ignoring it (fail-closed)",
++                server_name,
++            )
++            configured = []
++        _operator_approved_tools[server_name] = {
++            item.strip()
++            for item in configured
++            if isinstance(item, str)
++            and item.strip()
++            and item.strip() in discovered_names
++        }
++        conditional = (config or {}).get("operator_approved_tools_when_env", {})
++        if not isinstance(conditional, dict):
++            logger.warning(
++                "MCP trust: %s.operator_approved_tools_when_env must be a "
++                "mapping; ignoring it (fail-closed)",
++                server_name,
++            )
++            conditional = {}
++        approved_when_env: Dict[str, set[str]] = {}
++        for env_name, items in conditional.items():
++            if (
++                not isinstance(env_name, str)
++                or re.fullmatch(r"[A-Z_][A-Z0-9_]*", env_name) is None
++                or not isinstance(items, list)
++            ):
++                continue
++            approved_when_env[env_name] = {
++                item.strip()
++                for item in items
++                if isinstance(item, str)
++                and item.strip()
++                and item.strip() in discovered_names
++            }
++        _operator_approved_tools_when_env[server_name] = approved_when_env
+ 
+ 
+ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+@@ -4403,6 +4451,13 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+     trust = _server_trust_levels.get(server_name, _TRUST_FULL)
+     if trust != _TRUST_UNTRUSTED:
+         return None
++    if tool_name in _operator_approved_tools.get(server_name, set()):
++        return None
++    for env_name, approved_names in _operator_approved_tools_when_env.get(
++        server_name, {}
++    ).items():
++        if tool_name in approved_names and os.getenv(env_name) == "1":
++            return None
+     if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
+         return None
+ 

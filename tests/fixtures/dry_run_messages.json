@@ -1,0 +1,82 @@
+[
+  {
+    "name": "明确日期时间与分类",
+    "message_id": "dry-msg-001",
+    "text": "待办：明天下午3点提交报告，高优先级，工作",
+    "received_at": "2026-08-24T09:00:00+08:00"
+  },
+  {
+    "name": "模糊时段不编造钟点",
+    "message_id": "dry-msg-002",
+    "text": "待办：明天下午提交报销单，工作",
+    "received_at": "2026-08-24T09:01:00+08:00"
+  },
+  {
+    "name": "笔记与既有双链",
+    "message_id": "dry-msg-003",
+    "text": "笔记：AI个人秘书的产品方向要与年度目标保持一致",
+    "received_at": "2026-08-24T09:02:00+08:00"
+  },
+  {
+    "name": "笔记和行动项混合",
+    "message_id": "dry-msg-004",
+    "text": "记录产品路线图的新想法，另外周五提交原型评审材料，工作",
+    "received_at": "2026-08-24T09:03:00+08:00"
+  },
+  {
+    "name": "显式本地提醒但无截止时间",
+    "message_id": "dry-msg-005",
+    "text": "待办：半小时后提醒我提交费用申请",
+    "received_at": "2026-08-24T09:04:00+08:00"
+  },
+  {
+    "name": "收到不完成任务",
+    "message_id": "dry-msg-006",
+    "text": "收到",
+    "received_at": "2026-08-24T09:05:00+08:00"
+  },
+  {
+    "name": "明确完成最近任务",
+    "message_id": "dry-msg-007",
+    "text": "搞定了",
+    "received_at": "2026-08-24T09:06:00+08:00"
+  },
+  {
+    "name": "未知分类回落 Inbox",
+    "message_id": "dry-msg-008",
+    "text": "待办：后天预订旅行酒店，旅行",
+    "received_at": "2026-08-24T09:07:00+08:00"
+  },
+  {
+    "name": "查询今日任务",
+    "message_id": "dry-msg-009",
+    "text": "查一下我今天有哪些任务",
+    "received_at": "2026-08-24T09:08:00+08:00"
+  },
+  {
+    "name": "私密内容不出本机",
+    "message_id": "dry-msg-010",
+    "text": "私密：DRYRUN-PRIVATE-BODY-NEVER-ECHO",
+    "display_text": "私密：[内容已隐藏]",
+    "received_at": "2026-08-24T09:09:00+08:00"
+  },
+  {
+    "name": "同一微信消息去重",
+    "message_id": "dry-msg-001",
+    "text": "待办：明天下午3点提交报告，高优先级，工作",
+    "received_at": "2026-08-24T09:10:00+08:00"
+  },
+  {
+    "name": "私密下一条开关",
+    "message_id": "dry-msg-011",
+    "text": "私密：下一条",
+    "received_at": "2026-08-24T09:11:00+08:00"
+  },
+  {
+    "name": "私密下一条正文",
+    "message_id": "dry-msg-012",
+    "text": "DRYRUN-LATCHED-PRIVATE-BODY-NEVER-ECHO",
+    "display_text": "[下一条私密内容已隐藏]",
+    "received_at": "2026-08-24T09:11:30+08:00"
+  }
+]

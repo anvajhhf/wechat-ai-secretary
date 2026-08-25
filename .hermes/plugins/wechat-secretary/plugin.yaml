@@ -1,0 +1,4 @@
+name: wechat-secretary
+version: "0.1.0"
+description: Fail-closed Weixin personal secretary with private-message bypass and durable idempotency
+

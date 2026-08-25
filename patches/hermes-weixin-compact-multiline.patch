@@ -1,0 +1,24 @@
+diff --git a/gateway/platforms/weixin.py b/gateway/platforms/weixin.py
+index 3455c99..dfd4e3e 100644
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -926,15 +926,11 @@ def _split_text_for_weixin_delivery(
+             chunks.extend(_pack_markdown_blocks_for_weixin(unit, max_length))
+         return [c for c in chunks if c] or [content]
+ 
+-    # Compact (default): single message when under the limit — unless the
+-    # content looks like a short chatty exchange, in which case split into
+-    # separate bubbles for a more natural chat feel.
++    # Compact (default): keep every payload that fits in one Weixin message in
++    # one bubble.  Callers that explicitly want per-line bubbles can opt into
++    # the legacy mode with ``split_per_line=True``.
+     if len(content) <= max_length:
+-        return (
+-            [u for u in _split_delivery_units_for_weixin(content) if u]
+-            if _should_split_short_chat_block_for_weixin(content)
+-            else [content]
+-        )
++        return [content]
+     return _pack_markdown_blocks_for_weixin(content, max_length) or [content]
+ 
+ 

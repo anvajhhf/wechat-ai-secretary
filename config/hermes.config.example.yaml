@@ -1,0 +1,107 @@
+# 合并到项目专用 HERMES_HOME/config.yaml。这里没有任何真实凭证。
+_config_version: 38
+timezone: "Asia/Shanghai"
+
+model:
+  provider: "deepseek"
+  default: "deepseek-v4-flash"
+
+auxiliary:
+  wechat_secretary_classifier:
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
+    # 字段提取无需长推理；降低延迟与思考 token。
+    reasoning_effort: "none"
+    timeout: 60
+  wechat_secretary_vision:
+    provider: "deepseek"
+    model: "deepseek-v4-flash-vision-exp"
+    # 图片在一次结构化调用中完成理解与分类；不建立 Hermes 对话历史。
+    reasoning_effort: "none"
+    timeout: 60
+  wechat_secretary_deep_note:
+    provider: "deepseek"
+    model: "deepseek-v4-pro"
+    # 仅显式“深度笔记：”使用 Pro，默认不开思考以控制输出 token。
+    reasoning_effort: "none"
+    timeout: 60
+
+stt:
+  provider: "local"
+  language: "zh"
+  local:
+    model: "small"
+    language: "zh"
+    device: "cpu"
+    compute_type: "int8"
+    vad: true
+
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  write_approval: true
+
+skills:
+  write_approval: true
+
+security:
+  redact_secrets: true
+
+plugins:
+  enabled:
+    - wechat-secretary
+  entries:
+    wechat-secretary:
+      # 仅授予这个插件访问滴答服务器的权限；插件代码还会做工具级白名单。
+      mcp_allowlist: ["dida365"]
+
+mcp_servers:
+  dida365:
+    url: "https://mcp.dida365.com"
+    auth: oauth
+    oauth:
+      # 滴答公开元数据的 issuer 目前仅在根路径末尾斜杠上不一致。
+      # 兼容层仍严格限定 HTTPS、主机名和根路径。
+      issuer_trailing_slash_compat_host: "dida365.com"
+    trust: untrusted
+    operator_approved_tools:
+      # 仅免除这些只读工具的重复确认；创建与完成仍需后续显式解锁。
+      - list_projects
+      - list_project_groups
+      - list_columns
+      - list_tags
+      - search_task
+      - get_task_by_id
+      - get_project_by_id
+      - get_project_with_undone_tasks
+      - get_task_in_project
+      - list_undone_tasks_by_time_query
+      - list_undone_tasks_by_date
+      - list_completed_tasks_by_date
+      - filter_tasks
+    operator_approved_tools_when_env:
+      # 创建和完成分别确认；允许创建不会顺带允许完成已有任务。
+      SECRETARY_DIDA_CREATES_APPROVED:
+        - create_task
+      SECRETARY_DIDA_COMPLETIONS_APPROVED:
+        - complete_task
+    supports_parallel_tool_calls: false
+    tools:
+      include:
+        - list_projects
+        - list_project_groups
+        - list_columns
+        - list_tags
+        - search_task
+        - get_task_by_id
+        - get_project_by_id
+        - get_project_with_undone_tasks
+        - get_task_in_project
+        - list_undone_tasks_by_time_query
+        - list_undone_tasks_by_date
+        - list_completed_tasks_by_date
+        - filter_tasks
+        - create_task
+        - complete_task
+      resources: false
+      prompts: false
