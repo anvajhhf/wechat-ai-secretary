@@ -7,8 +7,16 @@ from pathlib import Path
 import sys
 
 
+def _project_root() -> Path | None:
+    """Return the validated project root that owns the required plugin."""
+
+    root = Path(__file__).resolve().parents[2]
+    manifest = root / ".hermes" / "plugins" / "wechat-secretary" / "plugin.yaml"
+    return root if manifest.is_file() else None
+
+
 def main() -> int:
-    """Validate the command-line profile marker, then hand off to Hermes."""
+    """Validate the profile and project plugin, then hand off to Hermes."""
 
     if (
         len(sys.argv) < 5
@@ -21,6 +29,24 @@ def main() -> int:
     try:
         if Path(declared).resolve() != Path(configured).resolve():
             return 2
+    except OSError:
+        return 2
+
+    # Hermes discovers project plugins relative to the process working
+    # directory.  Its Windows detacher normally anchors the child at
+    # HERMES_HOME, which would silently bypass this project's fail-closed
+    # Weixin hook and let the generic agent answer instead.  Refuse to start
+    # without the local plugin and always anchor discovery at this project.
+    project_root = _project_root()
+    if project_root is None or os.getenv("HERMES_ENABLE_PROJECT_PLUGINS", "").casefold() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return 2
+    try:
+        os.chdir(project_root)
     except OSError:
         return 2
 

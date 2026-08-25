@@ -1218,6 +1218,43 @@ class GatewayProfileIsolationTests(unittest.TestCase):
         ):
             self.assertEqual(2, gateway_entry_main())
 
+    def test_gateway_entry_anchors_plugin_discovery_at_project_root(self) -> None:
+        home = test_directory("gateway-entry-project-root")
+        observed: list[Path] = []
+        fake_main = ModuleType("hermes_cli.main")
+
+        def run_gateway() -> int:
+            observed.append(Path.cwd().resolve())
+            return 0
+
+        fake_main.main = run_gateway  # type: ignore[attr-defined]
+        argv = [
+            "hermes_gateway_entry.py",
+            "hermes_cli.main",
+            f"HERMES_HOME={home}",
+            "gateway",
+            "run",
+        ]
+        original_cwd = Path.cwd()
+        try:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "HERMES_HOME": str(home),
+                        "HERMES_ENABLE_PROJECT_PLUGINS": "true",
+                    },
+                    clear=False,
+                ),
+                patch.object(sys, "argv", argv),
+                patch.dict(sys.modules, {"hermes_cli.main": fake_main}),
+            ):
+                self.assertEqual(0, gateway_entry_main())
+        finally:
+            os.chdir(original_cwd)
+
+        self.assertEqual([ROOT.resolve()], observed)
+
     def test_exact_stopper_rejects_state_from_another_home(self) -> None:
         root = test_directory("gateway-stop-marker")
         expected_home = root / "owner"
@@ -2347,7 +2384,7 @@ class ReminderTests(unittest.TestCase):
         )
 
         self.assertEqual(ExecutionStatus.SUCCEEDED, result.status)
-        self.assertIn("已为你设置好微信提醒", result.reply)
+        self.assertIn("提醒你分选cD8", result.reply)
         self.assertEqual(0, classifier.call_count)
         finder.assert_called_once_with("分选cD8")
         self.assertEqual(
@@ -2644,6 +2681,51 @@ class DryRunCliTests(unittest.TestCase):
             rendered,
         )
         self.assertNotIn("准备", rendered)
+
+    def test_live_task_and_reminder_use_one_natural_result_line(self) -> None:
+        rendered = format_results(
+            (
+                ActionResult(
+                    "task",
+                    ExecutionStatus.SUCCEEDED,
+                    "看细胞状态",
+                    destination="Inbox",
+                    external_id="task-cell",
+                ),
+                ActionResult(
+                    "reminder",
+                    ExecutionStatus.SUCCEEDED,
+                    "2026-08-26 09:00｜看细胞状态",
+                    destination="微信",
+                    task_refs=(TaskReference("task-cell", "看细胞状态", "Inbox"),),
+                ),
+            ),
+            dry_run=False,
+        )
+        self.assertEqual(
+            "✅ 已设置好，2026-08-26 09:00 准时提醒你看细胞状态。",
+            rendered,
+        )
+        self.assertNotIn("Inbox", rendered)
+
+    def test_internal_tool_diagnostics_are_never_exposed(self) -> None:
+        rendered = format_results(
+            (
+                ActionResult(
+                    "reminder",
+                    ExecutionStatus.FAILED,
+                    "看细胞状态",
+                    error=(
+                        "File-mutation verifier: Git Bash not found; "
+                        "D:\\private\\cell_status_reminder.sh"
+                    ),
+                ),
+            ),
+            dry_run=False,
+        )
+        self.assertIn("内部核验未通过", rendered)
+        self.assertNotIn("Git Bash", rendered)
+        self.assertNotIn("D:\\", rendered)
 
     def test_live_preview_includes_actions_but_never_private_payload(self) -> None:
         rendered = add_dry_run_previews(

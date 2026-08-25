@@ -21,6 +21,14 @@ _INTERNAL_ERROR_MARKERS = (
     "task_id",
     "duedate",
     "isallday",
+    "file-mutation",
+    "git bash",
+    "powershell",
+    "traceback",
+    "permissionerror",
+    ".ps1",
+    ".sh",
+    "d:\\",
     "{",
     "}",
 )
@@ -55,13 +63,66 @@ def _success_line(result: ActionResult, dry_run: bool) -> str:
     if result.action == "complete":
         return f"已为你完成任务：{result.summary}｜{result.destination or 'Inbox'}"
     if result.action == "reminder":
-        return f"已为你设置好微信提醒：{result.summary}"
+        return _friendly_reminder_line(result)
     return result.summary
+
+
+def _reminder_parts(result: ActionResult) -> tuple[str, str]:
+    raw = str(result.summary or "").strip()
+    if "｜" not in raw:
+        return "", raw
+    reminder_at, title = raw.split("｜", 1)
+    return reminder_at.strip(), title.strip().rstrip("。！!？?，,；; ")
+
+
+def _friendly_reminder_line(result: ActionResult) -> str:
+    reminder_at, title = _reminder_parts(result)
+    if reminder_at and title:
+        return f"✅ 已设置好，{_compact(reminder_at, 32)} 准时提醒你{_compact(title, 80)}。"
+    if title:
+        return f"✅ 已设置好，提醒你{_compact(title, 100)}。"
+    return "✅ 提醒已经设置好了。"
+
+
+def _matching_live_reminders(
+    results: tuple[ActionResult, ...],
+) -> tuple[dict[int, int], set[int]]:
+    """Pair a created task with its reminder so live mode sends one result."""
+
+    pairs: dict[int, int] = {}
+    consumed: set[int] = set()
+    for task_index, task in enumerate(results):
+        if task.action != "task" or task.status is not ExecutionStatus.SUCCEEDED:
+            continue
+        for reminder_index, reminder in enumerate(results):
+            if (
+                reminder_index in consumed
+                or reminder.action != "reminder"
+                or reminder.status is not ExecutionStatus.SUCCEEDED
+            ):
+                continue
+            _, reminder_title = _reminder_parts(reminder)
+            same_reference = bool(task.external_id) and any(
+                ref.task_id == task.external_id for ref in reminder.task_refs
+            )
+            if same_reference or reminder_title == task.summary.strip():
+                pairs[task_index] = reminder_index
+                consumed.add(reminder_index)
+                break
+    return pairs, consumed
 
 
 def format_results(results: tuple[ActionResult, ...], dry_run: bool) -> str:
     lines: list[str] = []
-    for result in results:
+    paired, consumed = ({}, set()) if dry_run else _matching_live_reminders(results)
+    for index, result in enumerate(results):
+        if index in consumed:
+            continue
+        if index in paired:
+            line = _friendly_reminder_line(results[paired[index]])
+            if line not in lines:
+                lines.append(line)
+            continue
         if result.status in {ExecutionStatus.PLANNED, ExecutionStatus.SUCCEEDED}:
             line = _success_line(result, dry_run)
         elif result.status is ExecutionStatus.SKIPPED:
