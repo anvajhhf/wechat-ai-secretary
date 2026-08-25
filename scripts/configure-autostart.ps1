@@ -28,6 +28,24 @@ if (-not $Apply) {
 }
 
 Import-Module ScheduledTasks -ErrorAction Stop
+
+function Wait-ScheduledTaskNotRunning {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [int]$TimeoutSeconds = 15
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $current = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+        if ($null -eq $current -or $current.State -ne "Running") {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    throw "$Name 未能在限定时间内停止；为避免重启竞态，本次未继续安装。"
+}
+
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($Remove) {
     if (-not (Test-Path -LiteralPath $controlDir -PathType Container)) {
@@ -46,6 +64,7 @@ if ($Remove) {
 
 if ($null -ne $existing -and $existing.State -eq "Running") {
     Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Wait-ScheduledTaskNotRunning -Name $taskName
 }
 if (Test-Path -LiteralPath $disabledMarker -PathType Leaf) {
     Remove-Item -LiteralPath $disabledMarker -Force
@@ -80,5 +99,16 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
     -Force | Out-Null
 if ($StartNow) {
     Start-ScheduledTask -TaskName $taskName
+    $deadline = (Get-Date).AddSeconds(10)
+    do {
+        $started = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        if ($started.State -eq "Running") {
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    if ($started.State -ne "Running") {
+        throw "$taskName 启动后未保持运行，请检查网关状态。"
+    }
 }
 Write-Host "$taskName 已安装。后台启动与开机登录自启已启用。"

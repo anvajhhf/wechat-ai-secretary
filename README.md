@@ -260,7 +260,7 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 
 后台入口会为对应档案保留已经单独确认的微信回复、真实写入、任务完成和本地提醒权限。`owner` 与 `partner` 始终使用各自独立的进程、状态库和发送路由。
 
-后台监督器只记录固定的启动、退出、异常类型和停用事件，不记录微信正文、网页正文、ID 或凭证；日志在 `runtime/logs/<profile>` 内按 1 MiB 轮转。网关异常退出后会以最长 5 分钟退避持续恢复，Windows 计划任务本身仍保留额外重启保护。执行 `stop.ps1 -ConfirmStop` 会写入当前档案的停用标记，因此不会被监督器立即拉起；重新执行 `configure-autostart.ps1 -Apply -StartNow` 才恢复后台。
+后台监督器只记录固定的启动、退出、异常类型和停用事件，不记录微信正文、网页正文、ID 或凭证；日志在 `runtime/logs/<profile>` 内按 1 MiB 轮转。网关异常退出后会以最长 5 分钟退避持续恢复，Windows 计划任务本身仍保留额外重启保护。重新安装后台任务时会等待旧实例确实停止后再启动新实例，避免 Windows 把已经退出的旧实例误报为仍在运行。执行 `stop.ps1 -ConfirmStop` 会写入当前档案的停用标记，因此不会被监督器立即拉起；重新执行 `configure-autostart.ps1 -Apply -StartNow` 才恢复后台。
 
 ## 项目内加密备份
 
