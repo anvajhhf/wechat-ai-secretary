@@ -57,6 +57,7 @@ function Initialize-SecretaryProcess {
             $name -in @(
                 "DEEPSEEK_API_KEY",
                 "DEEPSEEK_BASE_URL",
+                "HERMES_GATEWAY_DETACHED",
                 "SECRETARY_DRY_RUN",
                 "SECRETARY_DIDA_WRITES_APPROVED",
                 "SECRETARY_DIDA_CREATES_APPROVED",

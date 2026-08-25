@@ -4,7 +4,8 @@ param(
     [switch]$ConfirmWechatReplies,
     [switch]$ConfirmRealWrites,
     [switch]$ConfirmTaskCompletion,
-    [switch]$ConfirmReminders
+    [switch]$ConfirmReminders,
+    [switch]$Detached
 )
 
 . (Join-Path $PSScriptRoot "common.ps1")
@@ -36,8 +37,26 @@ if ($LASTEXITCODE -ne 0) {
 # 严格检查已确认模型完整；运行阶段禁止 Hugging Face 自动联网或补下载。
 $env:HF_HUB_OFFLINE = "1"
 
-$hermes = Get-HermesCommand
+if ($Detached) {
+    $env:HERMES_GATEWAY_DETACHED = "1"
+    $launchOutput = & $python -m wechat_secretary.detached_gateway 2>&1
+    $launchExit = $LASTEXITCODE
+    $pidValue = 0
+    $lastLine = if (@($launchOutput).Count -gt 0) {
+        [string]@($launchOutput)[-1]
+    } else {
+        ""
+    }
+    if ($launchExit -ne 0 -or -not [int]::TryParse($lastLine.Trim(), [ref]$pidValue)) {
+        throw "后台网关启动失败；未显示内部信息或凭证。"
+    }
+    Write-Host "Hermes $Profile 档案已在当前用户下隐藏启动；未安装系统服务。"
+    exit 0
+}
+
 Set-Location -LiteralPath $script:SecretaryRoot
 Write-Host "Hermes $Profile 档案将以前台方式运行；按 Ctrl+C 停止。未安装系统服务。"
-& $hermes gateway run
+$profileMarker = "HERMES_HOME=$env:HERMES_HOME"
+& $python -m wechat_secretary.hermes_gateway_entry `
+    hermes_cli.main $profileMarker gateway run
 exit $LASTEXITCODE

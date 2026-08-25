@@ -24,6 +24,7 @@ from wechat_secretary.cli import (
 )
 from wechat_secretary.config import SecretarySettings
 from wechat_secretary.dida import DidaExecutor
+from wechat_secretary.hermes_gateway_entry import main as gateway_entry_main
 from wechat_secretary.hermes_plugin import GatewayBridge, _json_tool_result
 from wechat_secretary.ledger import IdempotencyLedger
 from wechat_secretary.media import (
@@ -45,6 +46,10 @@ from wechat_secretary.models import (
 )
 from wechat_secretary.obsidian import ObsidianExecutor
 from wechat_secretary.private_inbox import PrivateInboxExecutor
+from wechat_secretary.profile_gateway_stop import (
+    _validated_process,
+    main as profile_stop_main,
+)
 from wechat_secretary.reminders import ReminderQueue, ReminderScheduler
 from wechat_secretary.replies import add_dry_run_previews, format_results
 from wechat_secretary.service import SecretaryService
@@ -55,6 +60,9 @@ from wechat_secretary.web_reader import (
     WebPage,
     WebReadError,
     decide_link_note,
+    sanitize_web_page,
+    sanitize_web_url,
+    sanitize_web_urls_in_text,
 )
 from tools.mcp_oauth_manager import _normalize_root_issuer_trailing_slash
 from tools.mcp_tool import (
@@ -385,6 +393,29 @@ class WebLinkNoteTests(unittest.TestCase):
         self.assertIn("这是一段足够长", classifier.content)
         self.assertIn("https://example.com/article", result.results[0].preview)
 
+    def test_sensitive_link_parameters_are_transient_only(self) -> None:
+        classifier = self.CapturingClassifier()
+        web = self.StaticWeb()
+        app, _, _ = service_with(
+            settings(web_enabled=True), classifier=classifier, web=web
+        )
+        original = (
+            "https://example.com/source?v=42&xsec_token=remove-me"
+            "&utm_source=tracking#fragment"
+        )
+
+        result = app.handle(
+            message("web-sensitive-query", f"帮我记一下这个链接：{original}")
+        )
+
+        self.assertEqual([original], web.calls)
+        self.assertNotIn("xsec_", classifier.content)
+        self.assertNotIn("utm_", classifier.content)
+        self.assertNotIn("remove-me", classifier.content)
+        self.assertNotIn("remove-me", result.results[0].preview)
+        self.assertIn("https://example.com/source?v=42", classifier.content)
+        self.assertIn("https://example.com/source?v=42", result.results[0].preview)
+
     def test_deep_link_note_requires_explicit_deep_wording(self) -> None:
         classifier = self.CapturingClassifier()
         web = self.StaticWeb()
@@ -511,6 +542,45 @@ class SafeWebReaderTests(unittest.TestCase):
         self.assertEqual(LinkNoteMode.NORMAL, normal.mode)
         self.assertEqual(LinkNoteMode.DEEP, deep.mode)
         self.assertEqual(LinkNoteMode.NONE, task.mode)
+
+    def test_output_url_sanitizer_removes_credentials_tokens_and_trackers(self) -> None:
+        raw = (
+            "https://" + "user" + ":" + "password" + "@example.com/watch?v=abc"
+            "&access_token=remove-me&xsec_source=share&utm_campaign=test#fragment"
+        )
+        sanitized = sanitize_web_url(raw)
+        rendered = sanitize_web_urls_in_text(f"来源：{raw}。")
+
+        self.assertEqual("https://example.com/watch?v=abc", sanitized)
+        self.assertIn("https://example.com/watch?v=abc。", rendered)
+        for forbidden in ("user", "password", "access_token", "xsec_", "utm_", "remove-me"):
+            self.assertNotIn(forbidden, sanitized)
+            self.assertNotIn(forbidden, rendered)
+
+    def test_reader_fetches_full_url_but_returns_only_sanitized_source(self) -> None:
+        seen: list[str] = []
+
+        def request(url: str, addresses: tuple[str, ...], max_bytes: int, timeout: float) -> FetchResponse:
+            del addresses, max_bytes, timeout
+            seen.append(url)
+            return FetchResponse(
+                200,
+                {"content-type": "text/plain; charset=utf-8"},
+                b"public article body long enough for privacy boundary testing",
+            )
+
+        reader = SafeWebReader(
+            settings(web_enabled=True),
+            resolver=lambda host, port: (self.PUBLIC_IP,),
+            requester=request,
+        )
+        original = "https://example.com/article?id=7&xsec_token=remove-me"
+        page = reader.read(original)
+
+        self.assertEqual([original], seen)
+        self.assertEqual("https://example.com/article?id=7", page.source_url)
+        self.assertEqual("https://example.com/article?id=7", page.final_url)
+        self.assertNotIn("remove-me", repr(sanitize_web_page(page)))
 
     def test_private_and_nonstandard_targets_are_blocked(self) -> None:
         cfg = settings(web_enabled=True)
@@ -1127,6 +1197,55 @@ class ProfileIsolationTests(unittest.TestCase):
         self.assertNotEqual(owner.private_inbox_path, partner.private_inbox_path)
         self.assertTrue(all("hermes-home-partner" not in str(path) for path in owner.media_cache_roots))
         self.assertTrue(all("hermes-home-partner" in str(path) for path in partner.media_cache_roots))
+
+
+class GatewayProfileIsolationTests(unittest.TestCase):
+    def test_gateway_entry_rejects_a_mismatched_home_marker(self) -> None:
+        root = test_directory("gateway-entry-marker")
+        configured = root / "owner"
+        declared = root / "partner"
+        argv = [
+            "hermes_gateway_entry.py",
+            "hermes_cli.main",
+            f"HERMES_HOME={declared}",
+            "gateway",
+            "run",
+        ]
+
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(configured)}, clear=False),
+            patch.object(sys, "argv", argv),
+        ):
+            self.assertEqual(2, gateway_entry_main())
+
+    def test_exact_stopper_rejects_state_from_another_home(self) -> None:
+        root = test_directory("gateway-stop-marker")
+        expected_home = root / "owner"
+        expected_home.mkdir()
+        state = {
+            "pid": os.getpid(),
+            "start_time": 1,
+            "hermes_home": str(root / "partner"),
+        }
+        (expected_home / "gateway_state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+
+        self.assertIsNone(_validated_process(expected_home))
+        with (
+            patch.dict(os.environ, {"HERMES_HOME": str(expected_home)}, clear=False),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(1, profile_stop_main())
+
+    def test_profile_tagged_command_is_a_recognized_gateway(self) -> None:
+        from gateway.status import looks_like_gateway_command_line
+
+        command = (
+            "python -m wechat_secretary.hermes_gateway_entry hermes_cli.main "
+            "HERMES_HOME=D:/isolated/owner gateway run"
+        )
+        self.assertTrue(looks_like_gateway_command_line(command))
 
 
 class OAuthCompatibilityTests(unittest.TestCase):

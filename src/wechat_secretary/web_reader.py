@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from html.parser import HTMLParser
 from typing import Callable, Mapping, Protocol, Sequence
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from .config import SecretarySettings
 from .models import IntentKind
@@ -27,6 +27,21 @@ _NORMAL_LINK_CUE = re.compile(
     r"分析一下|看一下|看看|帮我(?:整理|总结|记录|看看))",
     re.IGNORECASE,
 )
+_SENSITIVE_QUERY_KEY = re.compile(
+    r"(?:token|secret|auth|sign(?:ature)?|session|credential|password|passwd|"
+    r"ticket|cookie|jwt|oauth|skey|access[_-]?key|api[_-]?key)",
+    re.IGNORECASE,
+)
+_TRACKING_QUERY_KEYS = {
+    "fbclid",
+    "gclid",
+    "igshid",
+    "mc_cid",
+    "mc_eid",
+    "msclkid",
+    "spm",
+    "yclid",
+}
 
 
 class LinkNoteMode(StrEnum):
@@ -49,6 +64,66 @@ def extract_web_urls(text: str) -> tuple[str, ...]:
         if value and value not in urls:
             urls.append(value)
     return tuple(urls)
+
+
+def sanitize_web_url(url: str) -> str:
+    """Remove credentials, share tokens, trackers and fragments from display URLs."""
+
+    candidate = (url or "").strip()
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.netloc:
+        return ""
+    try:
+        host = parsed.hostname or ""
+        port = parsed.port
+    except ValueError:
+        return ""
+    if not host:
+        return ""
+    host_for_url = f"[{host}]" if ":" in host else host
+    netloc = host_for_url if port is None else f"{host_for_url}:{port}"
+    kept: list[tuple[str, str]] = []
+    try:
+        pairs = parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+            strict_parsing=False,
+            max_num_fields=100,
+        )
+    except ValueError:
+        pairs = []
+    for key, value in pairs:
+        lowered = key.casefold().strip()
+        tracking = lowered.startswith(("utm_", "xsec_")) or lowered in _TRACKING_QUERY_KEYS
+        sensitive = bool(_SENSITIVE_QUERY_KEY.search(lowered))
+        nested_sensitive = bool(
+            re.search(
+                r"(?:token|secret|auth|signature|session|password|credential)=",
+                value,
+                re.IGNORECASE,
+            )
+        )
+        if tracking or sensitive or nested_sensitive:
+            continue
+        kept.append((key, value))
+    query = urlencode(kept, doseq=True)
+    return urlunsplit((parsed.scheme.casefold(), netloc, parsed.path or "/", query, ""))
+
+
+def sanitize_web_urls_in_text(text: str) -> str:
+    """Sanitize every HTTP(S) URL while preserving surrounding punctuation."""
+
+    def replace_url(match: re.Match[str]) -> str:
+        matched = match.group(0)
+        raw = matched.rstrip(_TRAILING_URL_PUNCTUATION)
+        suffix = matched[len(raw) :]
+        sanitized = sanitize_web_url(raw)
+        return (sanitized or "[链接参数已隐藏]") + suffix
+
+    return _URL_PATTERN.sub(replace_url, text or "")
 
 
 def decide_link_note(
@@ -83,6 +158,17 @@ class WebPage:
     final_url: str
     title: str
     text: str
+
+
+def sanitize_web_page(page: WebPage) -> WebPage:
+    """Enforce the model/note boundary even for alternate reader implementations."""
+
+    return WebPage(
+        source_url=sanitize_web_url(page.source_url),
+        final_url=sanitize_web_url(page.final_url),
+        title=sanitize_web_urls_in_text(page.title),
+        text=sanitize_web_urls_in_text(page.text),
+    )
 
 
 @dataclass(frozen=True)
@@ -401,10 +487,12 @@ class SafeWebReader:
                 title = title or (urlsplit(current).hostname or "网页笔记")
             if len(text.strip()) < 20:
                 raise WebReadError("网页没有足够的可读正文")
-            return WebPage(
-                source_url=source_url,
-                final_url=current,
-                title=title,
-                text=text,
+            return sanitize_web_page(
+                WebPage(
+                    source_url=source_url,
+                    final_url=current,
+                    title=title,
+                    text=text,
+                )
             )
         raise WebReadError("网页跳转次数过多")

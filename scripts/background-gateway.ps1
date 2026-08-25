@@ -44,29 +44,34 @@ function Write-SupervisorEvent {
         -Value "$timestamp|$Event|$safeDetail"
 }
 
-# This wrapper is invoked only by the per-user Scheduled Task installed after
-# all four runtime gates have been explicitly approved.
-$delaySeconds = 5
-while (-not (Test-Path -LiteralPath $disabledMarker -PathType Leaf)) {
-    Write-SupervisorEvent -Event "start"
-    $exitCode = 1
-    try {
-        & $startScript -Profile $Profile `
-            -ConfirmWechatReplies `
-            -ConfirmRealWrites `
-            -ConfirmTaskCompletion `
-            -ConfirmReminders
-        $exitCode = $LASTEXITCODE
-        Write-SupervisorEvent -Event "exit" -Detail ([string]$exitCode)
-    } catch {
-        Write-SupervisorEvent -Event "exception" `
-            -Detail $_.Exception.GetType().Name
-    }
-    if (Test-Path -LiteralPath $disabledMarker -PathType Leaf) {
-        break
-    }
-    Start-Sleep -Seconds $delaySeconds
-    $delaySeconds = [Math]::Min($delaySeconds * 2, 300)
+# This one-shot bootstrap is invoked only by the per-user Scheduled Task after
+# all four runtime gates have been explicitly approved. The gateway itself is
+# spawned with Hermes' canonical Windows detach flags; the separate health task
+# verifies the real PID and Weixin connection and performs bounded recovery.
+if (Test-Path -LiteralPath $disabledMarker -PathType Leaf) {
+    Write-SupervisorEvent -Event "disabled"
+    exit 0
 }
-Write-SupervisorEvent -Event "disabled"
-exit 0
+
+Write-SupervisorEvent -Event "start"
+$engine = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+if (-not $engine) {
+    $engine = (Get-Command powershell.exe -ErrorAction Stop).Source
+}
+try {
+    $launchOutput = & $engine -NoLogo -NoProfile -NonInteractive `
+        -WindowStyle Hidden -ExecutionPolicy Bypass -File $startScript `
+        -Profile $Profile -ConfirmWechatReplies -ConfirmRealWrites `
+        -ConfirmTaskCompletion -ConfirmReminders -Detached 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        Write-SupervisorEvent -Event "exception" -Detail "launch-failed"
+        exit $exitCode
+    }
+    Write-SupervisorEvent -Event "exit" -Detail "0"
+    exit 0
+} catch {
+    Write-SupervisorEvent -Event "exception" `
+        -Detail $_.Exception.GetType().Name
+    exit 1
+}

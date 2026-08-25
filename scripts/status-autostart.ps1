@@ -7,6 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 Import-Module ScheduledTasks -ErrorAction Stop
 $taskName = "WechatAISecretary-$Profile"
+$healthTaskName = "WechatAISecretaryHealth-$Profile"
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($null -eq $task) {
     Write-Host "$taskName：未安装"
@@ -22,6 +23,22 @@ $resultText = switch ([int]$info.LastTaskResult) {
 Write-Host "最近结果：$resultText"
 Write-Host "最近启动：$($info.LastRunTime)"
 $root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
+$healthTask = Get-ScheduledTask -TaskName $healthTaskName -ErrorAction SilentlyContinue
+if ($null -eq $healthTask) {
+    Write-Host "真实健康看护：未安装"
+} else {
+    Write-Host "真实健康看护：$($healthTask.State)"
+}
+$healthScript = Join-Path $PSScriptRoot "gateway-health.ps1"
+$engine = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+if (-not $engine) {
+    $engine = (Get-Command powershell.exe -ErrorAction Stop).Source
+}
+$healthOutput = & $engine -NoLogo -NoProfile -NonInteractive `
+    -WindowStyle Hidden -ExecutionPolicy Bypass `
+    -File $healthScript -Profile $Profile 2>&1
+$healthExit = $LASTEXITCODE
+$healthOutput | ForEach-Object { Write-Host $_ }
 $supervisorLog = Join-Path $root "runtime\logs\$Profile\supervisor.log"
 if (Test-Path -LiteralPath $supervisorLog -PathType Leaf) {
     $lastEvent = Get-Content -LiteralPath $supervisorLog -Tail 1
@@ -34,4 +51,7 @@ if (Test-Path -LiteralPath $supervisorLog -PathType Leaf) {
         }[$Matches[1]]
         Write-Host "监督状态：$eventLabel"
     }
+}
+if ($healthExit -ne 0) {
+    exit $healthExit
 }
