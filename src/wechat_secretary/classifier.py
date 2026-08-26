@@ -6,7 +6,16 @@ from datetime import datetime, timedelta
 from typing import Any, Protocol, Sequence
 
 from .config import SecretarySettings
-from .models import IntentKind, IntentPlan, MessageEnvelope, NoteDraft, TaskDraft, TaskQuery
+from .models import (
+    ClarificationReason,
+    IntentKind,
+    IntentPlan,
+    MessageEnvelope,
+    NoteDraft,
+    ReminderRecurrence,
+    TaskDraft,
+    TaskQuery,
+)
 
 
 INTENT_SCHEMA: dict[str, Any] = {
@@ -35,6 +44,17 @@ INTENT_SCHEMA: dict[str, Any] = {
                     "reminder_at": {
                         "type": "string",
                         "description": "Explicit local WeChat reminder ISO-8601 datetime or empty",
+                    },
+                    "reminder_recurrence": {
+                        "type": "object",
+                        "properties": {
+                            "frequency": {"type": "string", "enum": ["", "weekly"]},
+                            "interval": {"type": "integer", "minimum": 0, "maximum": 1},
+                            "weekday": {"type": "integer", "minimum": 0, "maximum": 7},
+                            "count": {"type": "integer", "minimum": 0, "maximum": 52},
+                        },
+                        "required": ["frequency", "interval", "weekday", "count"],
+                        "additionalProperties": False,
                     },
                 },
                 "required": [
@@ -81,6 +101,10 @@ INTENT_SCHEMA: dict[str, Any] = {
         },
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "clarification": {"type": "string"},
+        "clarification_reason": {
+            "type": "string",
+            "enum": [item.value for item in ClarificationReason],
+        },
     },
     "required": ["kind", "tasks", "notes", "query", "confidence", "clarification"],
     "additionalProperties": False,
@@ -92,6 +116,7 @@ TASK_ONLY_SCHEMA: dict[str, Any] = {
         "tasks": INTENT_SCHEMA["properties"]["tasks"],
         "confidence": INTENT_SCHEMA["properties"]["confidence"],
         "clarification": INTENT_SCHEMA["properties"]["clarification"],
+        "clarification_reason": INTENT_SCHEMA["properties"]["clarification_reason"],
     },
     "required": ["tasks", "confidence", "clarification"],
     "additionalProperties": False,
@@ -103,6 +128,7 @@ NOTE_ONLY_SCHEMA: dict[str, Any] = {
         "notes": INTENT_SCHEMA["properties"]["notes"],
         "confidence": INTENT_SCHEMA["properties"]["confidence"],
         "clarification": INTENT_SCHEMA["properties"]["clarification"],
+        "clarification_reason": INTENT_SCHEMA["properties"]["clarification_reason"],
     },
     "required": ["notes", "confidence", "clarification"],
     "additionalProperties": False,
@@ -202,6 +228,23 @@ def plan_from_mapping(
                     reminder_at = parsed_reminder.isoformat(timespec="minutes")
             except ValueError:
                 reminder_at = ""
+        recurrence: ReminderRecurrence | None = None
+        recurrence_raw = raw.get("reminder_recurrence")
+        if isinstance(recurrence_raw, dict):
+            frequency = _clean_string(recurrence_raw.get("frequency"), 20).lower()
+            try:
+                interval = int(recurrence_raw.get("interval", 0))
+                weekday = int(recurrence_raw.get("weekday", 0))
+                count = int(recurrence_raw.get("count", 0))
+            except (TypeError, ValueError):
+                interval = weekday = count = 0
+            if frequency == "weekly" and interval == 1 and 1 <= weekday <= 7:
+                recurrence = ReminderRecurrence(
+                    frequency="weekly",
+                    interval=1,
+                    weekday=weekday,
+                    count=count if 0 <= count <= 52 else 0,
+                )
         tasks.append(
             TaskDraft(
                 title=title,
@@ -212,6 +255,7 @@ def plan_from_mapping(
                 tags=tags,
                 description=_clean_string(raw.get("description"), 2000),
                 reminder_at=reminder_at,
+                reminder_recurrence=recurrence,
             )
         )
 
@@ -258,6 +302,16 @@ def plan_from_mapping(
     elif forced_kind is IntentKind.NOTE:
         kind, tasks = IntentKind.NOTE, []
 
+    if kind is IntentKind.TASK:
+        notes = []
+    elif kind is IntentKind.NOTE:
+        tasks = []
+    elif kind is IntentKind.QUERY:
+        tasks = []
+        notes = []
+    elif kind is IntentKind.CLARIFY:
+        notes = []
+
     if kind is IntentKind.TASK and not tasks:
         kind = IntentKind.CLARIFY
     if kind is IntentKind.NOTE and not notes:
@@ -266,9 +320,15 @@ def plan_from_mapping(
         kind = IntentKind.TASK if tasks else IntentKind.NOTE if notes else IntentKind.CLARIFY
 
     try:
-        confidence = max(0.0, min(float(payload.get("confidence", 1.0)), 1.0))
+        confidence = max(0.0, min(float(payload.get("confidence", 0.0)), 1.0))
     except (TypeError, ValueError):
         confidence = 0.0
+
+    raw_reason = _clean_string(payload.get("clarification_reason", "none"), 50)
+    try:
+        clarification_reason = ClarificationReason(raw_reason)
+    except ValueError:
+        clarification_reason = ClarificationReason.NONE
 
     return IntentPlan(
         kind=kind,
@@ -277,6 +337,7 @@ def plan_from_mapping(
         query=query if kind is IntentKind.QUERY else None,
         confidence=confidence,
         clarification=_clean_string(payload.get("clarification"), 300),
+        clarification_reason=clarification_reason,
     )
 
 
@@ -306,12 +367,15 @@ class HermesStructuredClassifier:
             f"参考时间：{received}；唯一时区：Asia/Shanghai；强制类型：{forced}。\n"
             f"{NOTE_CONTENT_RULES}\n"
             "一条消息最多提取 3 个对象；不确定就要求澄清，不得编造事实。"
+            "即使日期、时间或重复次数不完整，也要保留已经明确的任务标题并填写 clarification_reason。"
         )
         if forced_kind is IntentKind.TASK:
             rules = f"""
 只提取待办：标题、明确日期、明确钟点、优先级、分类和明确提醒。
 due_date/due_time 是截止或安排时间；reminder_at 只在用户明确说“提醒我”时填写，二者不可互推。
 没有明确钟点时 due_time 为空；仅“下午/晚上”不能编造时间。相对日期按参考时间计算。
+有限每周提醒只有在星期、具体钟点和总次数都明确时才填写 reminder_recurrence；
+frequency=weekly、interval=1、weekday 使用 ISO 1（周一）到 7（周日），count 包含第一次。
 category 只能从候选中选择，不确定留空并由执行器放入 Inbox。
 候选分类：{json.dumps(list(categories), ensure_ascii=False)}
 """.strip()
@@ -331,6 +395,8 @@ links 只能从现有候选中选择，最多 {self.settings.max_links} 个；�
             rules = f"""
 kind 只能是 task、note、mixed、query、clarify。只有具体可执行行动才算 task；想法、资料、感受通常是 note。
 due_date/due_time 与 reminder_at 不可互推；只有明确“提醒我”才填写 reminder_at；不得编造钟点。
+有限每周提醒只有在星期、具体钟点和总次数都明确时才填写 reminder_recurrence；
+frequency=weekly、interval=1、weekday 使用 ISO 1 到 7，count 包含第一次；缺字段时用 clarification_reason 说明。
 category 只能从候选中选；links 只能从现有候选中选且最多 {self.settings.max_links} 个。
 查询任务用 query；状态短语不要创建任务。
 候选分类：{json.dumps(list(categories), ensure_ascii=False)}
@@ -438,7 +504,16 @@ _ACTION_WORDS = (
     "续费",
     "取快递",
 )
-_NOTE_WORDS = ("记录", "想法", "灵感", "笔记", "总结", "资料")
+_NOTE_WORDS = (
+    "记一下",
+    "记下来",
+    "记录一下",
+    "记录下来",
+    "保存一下",
+    "整理成笔记",
+    "做个笔记",
+    "笔记：",
+)
 _WEEKDAY = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
 
 
@@ -567,10 +642,17 @@ class HeuristicClassifier:
             kind = forced_kind
         elif has_action and has_note and any(token in text for token in ("另外", "同时", "并且")):
             kind = IntentKind.MIXED
+        elif has_note:
+            kind = IntentKind.NOTE
         elif has_action:
             kind = IntentKind.TASK
         else:
-            kind = IntentKind.NOTE
+            return IntentPlan(
+                kind=IntentKind.CLARIFY,
+                confidence=0.25,
+                clarification="我还不能确定你想创建任务还是记录内容。",
+                clarification_reason=ClarificationReason.AMBIGUOUS_INTENT,
+            )
 
         category = next((item for item in categories if item and item in text), "")
         due_date = _resolve_date(text, now)

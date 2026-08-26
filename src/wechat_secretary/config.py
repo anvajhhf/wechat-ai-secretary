@@ -51,6 +51,7 @@ class SecretarySettings:
     private_next_ttl_seconds: int = 120
     completion_context_ttl_seconds: int = 86400
     completion_confirmation_ttl_seconds: int = 300
+    task_clarification_ttl_seconds: int = 600
     reminders_enabled: bool = False
     reminder_poll_seconds: int = 15
     reminder_overdue_merge_seconds: int = 7200
@@ -234,6 +235,10 @@ class SecretarySettings:
             completion_confirmation_ttl_seconds=max(
                 60,
                 min(int(wechat.get("completion_confirmation_ttl_seconds", 300)), 1800),
+            ),
+            task_clarification_ttl_seconds=max(
+                60,
+                min(int(wechat.get("task_clarification_ttl_seconds", 600)), 1800),
             ),
             reminders_enabled=_as_bool(reminders.get("enabled"), False),
             reminder_poll_seconds=max(

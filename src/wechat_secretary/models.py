@@ -24,6 +24,32 @@ class ExecutionStatus(StrEnum):
     SKIPPED = "skipped"
 
 
+class ClarificationReason(StrEnum):
+    NONE = "none"
+    AMBIGUOUS_INTENT = "ambiguous_intent"
+    MISSING_TASK_BODY = "missing_task_body"
+    MISSING_REMINDER_DATE = "missing_reminder_date"
+    MISSING_REMINDER_TIME = "missing_reminder_time"
+    MISSING_REMINDER_DATE_TIME = "missing_reminder_date_time"
+    MISSING_RECURRENCE_COUNT = "missing_recurrence_count"
+    MISSING_RECURRENCE_DETAILS = "missing_recurrence_details"
+    UNSUPPORTED_RECURRENCE = "unsupported_recurrence"
+    SEMANTIC_MISMATCH = "semantic_mismatch"
+
+
+@dataclass(frozen=True)
+class ReminderRecurrence:
+    """A finite local Weixin reminder series, never a Dida recurrence rule."""
+
+    frequency: str = "weekly"
+    interval: int = 1
+    weekday: int = 0
+    count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass(frozen=True)
 class MessageEnvelope:
     platform: str
@@ -45,6 +71,10 @@ class MessageEnvelope:
     def sender_key(self) -> str:
         return f"{self.platform}:{self.account_id}:{self.user_id}"
 
+    @property
+    def conversation_key(self) -> str:
+        return f"{self.platform}:{self.account_id}:{self.user_id}:{self.chat_id}"
+
 
 @dataclass(frozen=True)
 class TaskDraft:
@@ -56,6 +86,7 @@ class TaskDraft:
     tags: tuple[str, ...] = ()
     description: str = ""
     reminder_at: str = ""
+    reminder_recurrence: ReminderRecurrence | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,10 +130,20 @@ class IntentPlan:
     query: TaskQuery | None = None
     confidence: float = 1.0
     clarification: str = ""
+    clarification_reason: ClarificationReason = ClarificationReason.NONE
 
     @property
     def action_count(self) -> int:
         return len(self.tasks) + len(self.notes)
+
+
+@dataclass(frozen=True)
+class PendingTaskClarification:
+    reason: ClarificationReason
+    task: TaskDraft
+    reminder_date: str = ""
+    reminder_time: str = ""
+    source_message_id: str = ""
 
 
 @dataclass(frozen=True)

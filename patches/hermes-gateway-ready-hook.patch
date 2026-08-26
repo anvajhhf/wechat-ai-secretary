@@ -1,0 +1,78 @@
+diff --git a/gateway/run.py b/gateway/run.py
+index 84604b3..63d9fea 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -13182,2 +13182,3 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+         notified = await self._send_update_notification()
++        self._notify_gateway_ready_hooks(trigger="startup")
+         if not notified and any(
+@@ -14209,2 +14210,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+-
++
++    def _notify_gateway_ready_hooks(
++        self,
++        *,
++        trigger: str,
++        platform: Optional[Platform] = None,
++        profile_name: str = "",
++    ) -> None:
++        """Fire the best-effort ready observer at startup and after reconnects."""
++
++        try:
++            ready_loop = asyncio.get_running_loop()
++
++            def invoke_ready_hooks() -> None:
++                try:
++                    from hermes_cli.lifecycle import invoke_hook
++
++                    invoke_hook(
++                        "gateway_ready",
++                        gateway=self,
++                        adapters=self.adapters,
++                        loop=ready_loop,
++                        session_store=getattr(self, "session_store", None),
++                        trigger=trigger,
++                        platform=platform,
++                        profile_name=profile_name,
++                    )
++                except Exception as hook_exc:
++                    logger.warning("gateway_ready invocation failed: %s", hook_exc)
++
++            threading.Thread(
++                target=invoke_ready_hooks,
++                daemon=True,
++                name="gateway-ready-hooks",
++            ).start()
++        except Exception as hook_exc:
++            logger.warning("gateway_ready scheduling failed: %s", hook_exc)
++
+     async def _platform_reconnect_watcher(self) -> None:
+@@ -14355,2 +14393,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+-
++
++                        self._notify_gateway_ready_hooks(
++                            trigger="platform_reconnect", platform=platform
++                        )
++
+                         # A platform that was offline at gateway startup never
+@@ -15467,2 +15509,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
+                             self._sync_voice_mode_state_to_adapter(adapter)
++                            self._notify_gateway_ready_hooks(
++                                trigger="profile_platform_reconnect",
++                                platform=platform,
++                                profile_name=profile_name,
++                            )
+                             logger.info(
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index 2493d8f..36a13a4 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -233,2 +233,8 @@ VALID_HOOKS: Set[str] = {
+     "pre_gateway_dispatch",
++    # Gateway ready observer hook. Fired best-effort after configured platform
++    # adapters reach the startup boundary and again when an offline adapter
++    # reconnects. Return values are ignored.
++    # Kwargs: gateway, adapters, loop, session_store, trigger, platform,
++    # profile_name.
++    "gateway_ready",
+     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous

@@ -38,6 +38,12 @@ from .prefixes import parse_prefix
 from .private_inbox import PrivateInboxExecutor
 from .reminders import ReminderQueue
 from .replies import format_failure, format_results
+from .routing import detect_route_hint
+from .semantic_guard import (
+    looks_like_pending_followup,
+    resume_pending_task,
+    validate_plan_semantics,
+)
 from .web_reader import (
     DisabledWebReader,
     LinkNoteMode,
@@ -48,6 +54,9 @@ from .web_reader import (
     sanitize_web_page,
     sanitize_web_urls_in_text,
 )
+
+
+_FAILED_OPERATION_REPLAY = "此前写操作失败；为避免重复，本次没有自动重试"
 
 
 class SecretaryService:
@@ -107,7 +116,7 @@ class SecretaryService:
                     previous,
                     status=ExecutionStatus.UNCERTAIN,
                     preview="",
-                    error="此前写操作失败；为避免重复，本次没有自动重试",
+                    error=_FAILED_OPERATION_REPLAY,
                 )
             if previous.status in {ExecutionStatus.PLANNED, ExecutionStatus.SUCCEEDED}:
                 return replace(
@@ -247,6 +256,7 @@ class SecretaryService:
         return (
             "我可以帮你创建待办、保存笔记、完成指定任务、设置提醒，以及读取公开链接。\n"
             "直接自然描述即可；例如“明天下午3点提醒我回电话”或“帮我记一下这个链接：网址”。\n"
+            "有限重复提醒可以说“每周二上午9点提醒我买抗体，共3次”；缺少时间或次数时我会继续追问。\n"
             "只有明确说“深度笔记”或“深入分析”才会使用深度整理；私密内容请使用“私密：”。"
         )
 
@@ -257,15 +267,6 @@ class SecretaryService:
     ) -> IntentPlan:
         """Accept a plain explicit title, but never discard unparsed scheduling data."""
 
-        if plan.tasks:
-            return replace(
-                plan,
-                kind=IntentKind.TASK,
-                notes=(),
-                query=None,
-                confidence=1.0,
-                clarification="",
-            )
         compact = re.sub(r"\s+", " ", content).strip()
         structured_markers = re.search(
             r"(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}月\d{1,2}日|"
@@ -277,6 +278,15 @@ class SecretaryService:
             category and category in compact
             for category in self.settings.category_map
         )
+        if plan.tasks and (structured_markers or has_category or len(plan.tasks) > 1):
+            return replace(
+                plan,
+                kind=IntentKind.TASK,
+                notes=(),
+                query=None,
+                confidence=1.0,
+                clarification="",
+            )
         if structured_markers or has_category:
             return plan
         title = compact.strip(" ，。,:：;；")[:300]
@@ -451,6 +461,19 @@ class SecretaryService:
             )
             return HandlingResult(status=ExecutionStatus.SKIPPED, reply=reply)
         task = context.candidates[0]
+        if self.ledger.active_reminder_count(task.task_id, message) > 1:
+            self.ledger.finish(
+                message,
+                ExecutionStatus.SKIPPED,
+                error_code="recurring-reminder-reschedule-ambiguous",
+            )
+            return HandlingResult(
+                status=ExecutionStatus.SKIPPED,
+                reply=(
+                    "这是一个重复提醒。当前版本不会猜测你想只调整本次还是整个系列，"
+                    "因此没有改动；请先完成或取消原任务，再重新设置。"
+                ),
+            )
         draft = TaskDraft(
             title=task.title,
             reminder_at=reminder_at.isoformat(timespec="minutes"),
@@ -500,6 +523,19 @@ class SecretaryService:
             return HandlingResult(status=ExecutionStatus.SKIPPED, reply=reply)
 
         task = refs[0]
+        if self.ledger.active_reminder_count(task.task_id, message) > 1:
+            self.ledger.finish(
+                message,
+                ExecutionStatus.SKIPPED,
+                error_code="recurring-reminder-reschedule-ambiguous",
+            )
+            return HandlingResult(
+                status=ExecutionStatus.SKIPPED,
+                reply=(
+                    "这是一个重复提醒。当前版本不会猜测你想只调整本次还是整个系列，"
+                    "因此没有改动；请先完成或取消原任务，再重新设置。"
+                ),
+            )
         draft = TaskDraft(
             title=task.title,
             reminder_at=reminder_at.isoformat(timespec="minutes"),
@@ -529,6 +565,127 @@ class SecretaryService:
                 reminder_at=reminder_at,
             )
         return self._finalize(message, [result])
+
+    def _execute_plan(
+        self,
+        message: MessageEnvelope,
+        plan: IntentPlan,
+        now: datetime,
+        *,
+        llm_called: bool,
+    ) -> HandlingResult:
+        if plan.action_count > self.settings.max_actions_per_message:
+            self.ledger.finish(message, ExecutionStatus.SKIPPED, error_code="too-many-actions")
+            return HandlingResult(
+                status=ExecutionStatus.SKIPPED,
+                reply=(
+                    f"这条包含 {plan.action_count} 个操作对象。为避免弄错，请拆成不超过 "
+                    f"{self.settings.max_actions_per_message} 个操作后再发。"
+                ),
+                llm_called=llm_called,
+            )
+
+        results: list[ActionResult] = []
+        task_context: list[TaskReference] = []
+        for index, task in enumerate(plan.tasks):
+            task_result = self._run_operation(
+                message,
+                f"task_create:{index}",
+                "task",
+                lambda task=task: self.dida.create_task(task, message),
+                retry_failed=False,
+            )
+            results.append(task_result)
+            if task_result.task_refs and task_result.status in {
+                ExecutionStatus.PLANNED,
+                ExecutionStatus.SUCCEEDED,
+                ExecutionStatus.SKIPPED,
+            }:
+                task_context.extend(task_result.task_refs)
+            if task.reminder_at:
+                if task_result.task_refs and task_result.status in {
+                    ExecutionStatus.PLANNED,
+                    ExecutionStatus.SUCCEEDED,
+                    ExecutionStatus.SKIPPED,
+                }:
+                    reminder_result = self._run_operation(
+                        message,
+                        f"reminder_create:{index}",
+                        "reminder",
+                        lambda task=task, ref=task_result.task_refs[0]: self.reminders.schedule(
+                            task, ref, message
+                        ),
+                    )
+                else:
+                    dependency_status = (
+                        ExecutionStatus.UNCERTAIN
+                        if task_result.status is ExecutionStatus.UNCERTAIN
+                        else ExecutionStatus.FAILED
+                    )
+                    reminder_result = self._run_operation(
+                        message,
+                        f"reminder_create:{index}",
+                        "reminder",
+                        lambda task=task, status=dependency_status: ActionResult(
+                            action="reminder",
+                            status=status,
+                            summary=task.title,
+                            destination="微信",
+                            error="任务 task_id 未确认，未创建本地提醒",
+                        ),
+                    )
+                results.append(reminder_result)
+
+        if task_context:
+            self.ledger.record_task_context(
+                message.sender_key,
+                task_context,
+                batch_id=message.message_id,
+                source_message_id=message.message_id,
+                observed_at=now,
+                ttl_seconds=self.settings.completion_context_ttl_seconds,
+                context_kind="task-create",
+            )
+
+        for index, note in enumerate(plan.notes):
+            results.append(
+                self._run_operation(
+                    message,
+                    f"note_write:{index}",
+                    "note",
+                    lambda note=note: self.obsidian.save(note, message),
+                )
+            )
+        if plan.kind is IntentKind.QUERY and plan.query is not None:
+            query_result = self._run_operation(
+                message,
+                "task_query:0",
+                "query",
+                lambda: self.dida.query_tasks(plan.query),
+            )
+            results.append(query_result)
+            if query_result.task_refs:
+                self.ledger.record_task_context(
+                    message.sender_key,
+                    query_result.task_refs,
+                    batch_id=message.message_id,
+                    source_message_id=message.message_id,
+                    observed_at=now,
+                    ttl_seconds=self.settings.completion_context_ttl_seconds,
+                    context_kind="task-query",
+                )
+
+        if not results:
+            self.ledger.finish(message, ExecutionStatus.SKIPPED, error_code="empty-plan")
+            return HandlingResult(
+                status=ExecutionStatus.SKIPPED,
+                reply=(
+                    "我暂时没有识别到这条中的可处理内容。你可以直接说“明天下午3点提醒我回电话”"
+                    "或“帮我记一下……”。"
+                ),
+                llm_called=llm_called,
+            )
+        return self._finalize(message, results, llm_called=llm_called)
 
     def handle(self, message: MessageEnvelope) -> HandlingResult:
         if not self.accepts(message):
@@ -634,7 +791,7 @@ class SecretaryService:
                 part for part in (content, prepared.transcript_text) if part
             )
             if decision.forced_kind is None:
-                spoken_decision = parse_prefix(content)
+                spoken_decision = parse_prefix(content, speech=True)
                 if spoken_decision.private:
                     self.ledger.finish(
                         message,
@@ -650,6 +807,8 @@ class SecretaryService:
                     )
                 if spoken_decision.forced_kind is not None:
                     decision = spoken_decision
+                    content = spoken_decision.content.strip()
+                else:
                     content = spoken_decision.content.strip()
 
         if decision.forced_kind is None:
@@ -679,9 +838,21 @@ class SecretaryService:
             mode = "模拟模式" if self.settings.dry_run else "正式模式"
             reminder = "提醒已启用" if self.settings.reminders_enabled else "提醒未启用"
             web = "链接笔记已启用" if self.settings.web_enabled else "链接笔记未启用"
+            health_getter = getattr(self.dida, "health_summary", None)
+            try:
+                health = health_getter() if callable(health_getter) else {}
+            except Exception:
+                health = {}
+            if not isinstance(health, dict):
+                health = {}
+            dida_status = {
+                "recent_success": "滴答最近连接正常",
+                "connection_fault": "滴答连接故障",
+                "result_uncertain": "滴答有一项结果待确认",
+            }.get(str(health.get("status", "")), "滴答状态尚未检测")
             return HandlingResult(
                 status=ExecutionStatus.SUCCEEDED,
-                reply=f"我在正常运行｜{mode}｜{reminder}｜{web}",
+                reply=f"我在正常运行｜{mode}｜{reminder}｜{web}｜{dida_status}",
             )
 
         if not content and not prepared.images:
@@ -690,6 +861,112 @@ class SecretaryService:
                 status=ExecutionStatus.FAILED,
                 reply=format_failure("我没有识别到可处理的文字、图片或语音内容。"),
             )
+
+        route_hint = detect_route_hint(
+            content,
+            explicit_kind=decision.forced_kind,
+            speech=bool(prepared.transcript_text),
+        )
+        if (
+            decision.forced_kind is None
+            and route_hint.kind is None
+            and looks_like_pending_followup(content)
+        ):
+            pending_claim = self.ledger.claim_pending_task(
+                message.conversation_key,
+                message.message_id,
+                now,
+            )
+            if pending_claim.state in {"claimed", "uncertain"} and pending_claim.pending is None:
+                status = (
+                    ExecutionStatus.UNCERTAIN
+                    if pending_claim.state == "uncertain"
+                    else ExecutionStatus.SKIPPED
+                )
+                self.ledger.finish(
+                    message,
+                    status,
+                    error_code=f"pending-task-{pending_claim.state}",
+                )
+                return HandlingResult(
+                    status=status,
+                    reply=(
+                        "上一次补充正在处理，暂时不要重复发送。"
+                        if status is ExecutionStatus.SKIPPED
+                        else "上一次任务创建结果还不能确认。为避免重复，我没有再次创建。"
+                    ),
+                )
+            if pending_claim.pending is not None:
+                if re.sub(r"\s+", "", content) in {"取消", "算了", "不用了", "不设置了"}:
+                    self.ledger.complete_pending_task(
+                        message.conversation_key, message.message_id
+                    )
+                    self.ledger.finish(message, ExecutionStatus.SKIPPED)
+                    return HandlingResult(
+                        status=ExecutionStatus.SKIPPED,
+                        reply="好的，已取消这次待补充的任务，没有创建任何内容。",
+                    )
+                resumed = resume_pending_task(pending_claim.pending, content, now)
+                if not resumed.ready:
+                    updated = resumed.pending or pending_claim.pending
+                    updated = replace(
+                        updated,
+                        source_message_id=pending_claim.pending.source_message_id,
+                    )
+                    self.ledger.release_pending_task(
+                        message.conversation_key,
+                        message.message_id,
+                        updated,
+                    )
+                    self.ledger.finish(
+                        message,
+                        ExecutionStatus.SKIPPED,
+                        error_code=resumed.reason.value,
+                    )
+                    return HandlingResult(
+                        status=ExecutionStatus.SKIPPED,
+                        reply=resumed.question,
+                    )
+                handled = self._execute_plan(
+                    message, resumed.plan, now, llm_called=False
+                )
+                task_results = tuple(
+                    item for item in handled.results if item.action == "task"
+                )
+                has_true_uncertainty = any(
+                    item.status is ExecutionStatus.UNCERTAIN
+                    and item.error != _FAILED_OPERATION_REPLAY
+                    for item in task_results
+                )
+                if has_true_uncertainty:
+                    self.ledger.mark_pending_task_uncertain(
+                        message.conversation_key, message.message_id
+                    )
+                elif any(
+                    item.status
+                    in {
+                        ExecutionStatus.PLANNED,
+                        ExecutionStatus.SUCCEEDED,
+                        ExecutionStatus.SKIPPED,
+                    }
+                    for item in task_results
+                ):
+                    self.ledger.complete_pending_task(
+                        message.conversation_key, message.message_id
+                    )
+                else:
+                    # A duplicate delivery of a known failed-before-success
+                    # operation is blocked under the same message ID. Keep the
+                    # clarification available so a deliberate new reply can
+                    # safely retry it instead of permanently latching uncertain.
+                    self.ledger.release_pending_task(
+                        message.conversation_key,
+                        message.message_id,
+                        pending_claim.pending,
+                    )
+                return handled
+        elif decision.forced_kind is not None or route_hint.kind is not None:
+            self.ledger.abandon_pending_task(message.conversation_key)
 
         model_content = content
         web_page: WebPage | None = None
@@ -752,12 +1029,24 @@ class SecretaryService:
             model_content = self._web_model_content(content, web_page, now)
 
         links = self.obsidian.available_links(model_content)
+        classification_kind = decision.forced_kind
+        if classification_kind is None and prepared.images and not content:
+            # Sending an image by itself is an explicit request to capture its
+            # contents, but it must never authorize an inferred external task.
+            classification_kind = IntentKind.NOTE
+        if classification_kind is None and route_hint.kind in {
+            IntentKind.TASK,
+            IntentKind.NOTE,
+            IntentKind.MIXED,
+            IntentKind.QUERY,
+        }:
+            classification_kind = route_hint.kind
         before_calls = self.classifier.call_count
         try:
             plan = self.classifier.classify(
                 message,
                 model_content,
-                decision.forced_kind,
+                classification_kind,
                 tuple(self.settings.category_map),
                 links,
                 deep_note=decision.deep_note,
@@ -786,125 +1075,52 @@ class SecretaryService:
         elif decision.forced_kind is IntentKind.NOTE and content:
             plan = self._honor_explicit_note(plan, content, tuple(links))
 
-        if plan.kind is IntentKind.CLARIFY or plan.confidence < 0.55:
-            if decision.forced_kind is IntentKind.TASK:
-                question = "为了避免创建错任务，请再补充明确的任务内容、日期或时间。"
-            elif decision.forced_kind is IntentKind.NOTE:
-                question = "为了避免整理错笔记，请再补充一下需要记录的内容。"
+        guard = validate_plan_semantics(
+            content,
+            plan,
+            now,
+            expected_kind=classification_kind,
+            allow_enriched_note=bool(web_page is not None or prepared.images),
+            allow_explicit_task_fallback=decision.forced_kind is IntentKind.TASK,
+        )
+        plan = guard.plan
+        if not guard.ready or plan.kind is IntentKind.CLARIFY or plan.confidence < 0.55:
+            if guard.pending is not None:
+                pending = replace(
+                    guard.pending,
+                    source_message_id=message.message_id,
+                )
+                self.ledger.set_pending_task(
+                    message.conversation_key,
+                    pending,
+                    now + timedelta(seconds=self.settings.task_clarification_ttl_seconds),
+                )
+            if guard.question:
+                question = guard.question
+                reason = guard.reason.value
+            elif plan.clarification:
+                question = plan.clarification
+                reason = plan.clarification_reason.value
+            elif classification_kind is IntentKind.TASK:
+                question = "我知道你想创建任务，但还缺少可靠的任务内容或时间，请再补充一下。"
+                reason = "needs-task-details"
+            elif classification_kind is IntentKind.NOTE:
+                question = "我知道你想记下来，但还没有提取出可靠的正文，请再补充一下内容。"
+                reason = "needs-note-details"
             else:
-                question = "这条内容我还不能准确判断，请加上“待办：”或“笔记：”。"
-            self.ledger.finish(message, ExecutionStatus.SKIPPED, error_code="needs-clarification")
+                question = (
+                    "这条内容我还不能准确判断。你可以直接说“明天下午3点提醒我回电话”"
+                    "或“帮我记一下……”。"
+                )
+                reason = "ambiguous-intent"
+            self.ledger.finish(message, ExecutionStatus.SKIPPED, error_code=reason)
             return HandlingResult(
                 status=ExecutionStatus.SKIPPED,
                 reply=question,
                 llm_called=llm_called,
             )
-        if plan.action_count > self.settings.max_actions_per_message:
-            self.ledger.finish(message, ExecutionStatus.SKIPPED, error_code="too-many-actions")
-            return HandlingResult(
-                status=ExecutionStatus.SKIPPED,
-                reply=f"这条包含 {plan.action_count} 个操作对象。为避免弄错，请拆成不超过 {self.settings.max_actions_per_message} 个操作后再发。",
-                llm_called=llm_called,
-            )
-
-        results: list[ActionResult] = []
-        task_context: list[TaskReference] = []
-        for index, task in enumerate(plan.tasks):
-            task_result = self._run_operation(
-                message,
-                f"task_create:{index}",
-                "task",
-                lambda task=task: self.dida.create_task(task, message),
-                retry_failed=False,
-            )
-            results.append(task_result)
-            if task_result.task_refs and task_result.status in {
-                ExecutionStatus.PLANNED,
-                ExecutionStatus.SUCCEEDED,
-                ExecutionStatus.SKIPPED,
-            }:
-                task_context.extend(task_result.task_refs)
-            if task.reminder_at:
-                if task_result.task_refs and task_result.status in {
-                    ExecutionStatus.PLANNED,
-                    ExecutionStatus.SUCCEEDED,
-                    ExecutionStatus.SKIPPED,
-                }:
-                    reminder_result = self._run_operation(
-                        message,
-                        f"reminder_create:{index}",
-                        "reminder",
-                        lambda task=task, ref=task_result.task_refs[0]: self.reminders.schedule(
-                            task, ref, message
-                        ),
-                    )
-                else:
-                    dependency_status = (
-                        ExecutionStatus.UNCERTAIN
-                        if task_result.status is ExecutionStatus.UNCERTAIN
-                        else ExecutionStatus.FAILED
-                    )
-                    reminder_result = self._run_operation(
-                        message,
-                        f"reminder_create:{index}",
-                        "reminder",
-                        lambda task=task, status=dependency_status: ActionResult(
-                            action="reminder",
-                            status=status,
-                            summary=task.title,
-                            destination="微信",
-                            error="任务 task_id 未确认，未创建本地提醒",
-                        ),
-                    )
-                results.append(reminder_result)
-
-        if task_context:
-            self.ledger.record_task_context(
-                message.sender_key,
-                task_context,
-                batch_id=message.message_id,
-                source_message_id=message.message_id,
-                observed_at=now,
-                ttl_seconds=self.settings.completion_context_ttl_seconds,
-                context_kind="task-create",
-            )
-
-        for index, note in enumerate(plan.notes):
-            results.append(
-                self._run_operation(
-                    message,
-                    f"note_write:{index}",
-                    "note",
-                    lambda note=note: self.obsidian.save(note, message),
-                )
-            )
-        if plan.kind is IntentKind.QUERY and plan.query is not None:
-            query_result = self._run_operation(
-                message,
-                "task_query:0",
-                "query",
-                lambda: self.dida.query_tasks(plan.query),
-            )
-            results.append(query_result)
-            if query_result.task_refs:
-                self.ledger.record_task_context(
-                    message.sender_key,
-                    query_result.task_refs,
-                    batch_id=message.message_id,
-                    source_message_id=message.message_id,
-                    observed_at=now,
-                    ttl_seconds=self.settings.completion_context_ttl_seconds,
-                    context_kind="task-query",
-                )
-
-        if not results:
-            self.ledger.finish(message, ExecutionStatus.SKIPPED, error_code="empty-plan")
-            return HandlingResult(
-                status=ExecutionStatus.SKIPPED,
-                reply="我暂时没有识别到这条中的可处理内容，请换一种说法，或加上“待办：”“笔记：”。",
-                llm_called=llm_called,
-            )
-        return self._finalize(message, results, llm_called=llm_called)
+        self.ledger.abandon_pending_task(message.conversation_key)
+        return self._execute_plan(message, plan, now, llm_called=llm_called)
 
     def run_scheduled_digest(self, job_name: str) -> str:
         now = datetime.now(self.settings.tz)

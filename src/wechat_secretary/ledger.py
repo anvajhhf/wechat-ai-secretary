@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -8,7 +9,16 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
-from .models import ActionResult, ExecutionStatus, MessageEnvelope, TaskReference
+from .models import (
+    ActionResult,
+    ClarificationReason,
+    ExecutionStatus,
+    MessageEnvelope,
+    PendingTaskClarification,
+    ReminderRecurrence,
+    TaskDraft,
+    TaskReference,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +42,12 @@ class ContextLookup:
 
 
 @dataclass(frozen=True)
+class PendingTaskClaim:
+    pending: PendingTaskClarification | None
+    state: str = "none"
+
+
+@dataclass(frozen=True)
 class ReminderRecord:
     row_id: int
     task: TaskReference
@@ -44,8 +60,16 @@ class ReminderRecord:
     attempts: int
 
 
+class ReminderRouteConflictError(RuntimeError):
+    """Refuse to move an existing reminder to a different delivery route."""
+
+
 class IdempotencyLedger:
-    """Durable local state. It never stores inbound message bodies or credentials."""
+    """Durable local state without credentials or complete inbound message bodies.
+
+    A pending clarification keeps only a short-lived, minimized structured task
+    draft so a reply such as ``上午9点`` can be joined to the preceding request.
+    """
 
     def __init__(self, path: Path | str):
         self._path = str(path)
@@ -141,6 +165,18 @@ class IdempotencyLedger:
                     expires_at TEXT NOT NULL,
                     PRIMARY KEY (sender_hash, ordinal)
                 );
+                CREATE TABLE IF NOT EXISTS pending_task_clarifications (
+                    conversation_hash TEXT PRIMARY KEY,
+                    reason TEXT NOT NULL,
+                    draft_json TEXT NOT NULL,
+                    reminder_date TEXT NOT NULL DEFAULT '',
+                    reminder_time TEXT NOT NULL DEFAULT '',
+                    source_message_id TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    claimed_by_message_id TEXT NOT NULL DEFAULT '',
+                    expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id TEXT NOT NULL,
@@ -172,6 +208,7 @@ class IdempotencyLedger:
                 );
                 """
             )
+            self._purge_expired_pending_tasks_locked(datetime.now(timezone.utc))
             operation_columns = {
                 str(row["name"])
                 for row in self._connection.execute("PRAGMA table_info(operations)")
@@ -625,23 +662,454 @@ class IdempotencyLedger:
                 (self._hash(sender_key),),
             )
 
-    def mark_task_completed(self, sender_key: str, task_id: str) -> None:
-        sender_hash = self._hash(sender_key)
+    @staticmethod
+    def _pending_draft_json(pending: PendingTaskClarification) -> str:
+        # Persist only what is required to resume a clarification.  In
+        # particular, do not retain model-produced descriptions, categories,
+        # tags, or other free-form copies of the inbound message.
+        task = pending.task
+        minimized = TaskDraft(
+            title=task.title[:300],
+            due_date=task.due_date,
+            due_time=task.due_time,
+            reminder_at=task.reminder_at,
+            reminder_recurrence=task.reminder_recurrence,
+        )
+        return json.dumps(
+            minimized.to_dict(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _pending_expired(expires_at: object, now: datetime) -> bool:
+        try:
+            parsed = datetime.fromisoformat(str(expires_at))
+        except ValueError:
+            return True
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc) < now.astimezone(timezone.utc)
+
+    def _purge_expired_pending_tasks_locked(
+        self,
+        now: datetime,
+        *,
+        exclude_conversation_hash: str = "",
+    ) -> int:
+        rows = self._connection.execute(
+            "SELECT conversation_hash, expires_at FROM pending_task_clarifications"
+        ).fetchall()
+        stale = tuple(
+            (str(row["conversation_hash"]),)
+            for row in rows
+            if str(row["conversation_hash"]) != exclude_conversation_hash
+            and self._pending_expired(row["expires_at"], now)
+        )
+        if stale:
+            self._connection.executemany(
+                "DELETE FROM pending_task_clarifications WHERE conversation_hash = ?",
+                stale,
+            )
+        return len(stale)
+
+    def purge_expired_pending_tasks(self, now: datetime | None = None) -> int:
+        """Remove expired clarification payloads across every conversation."""
+
+        with self._lock:
+            return self._purge_expired_pending_tasks_locked(
+                now or datetime.now(timezone.utc)
+            )
+
+    @staticmethod
+    def _pending_from_row(row: sqlite3.Row) -> PendingTaskClarification:
+        raw = json.loads(str(row["draft_json"]))
+        if not isinstance(raw, dict):
+            raise ValueError("invalid pending task draft")
+        recurrence_raw = raw.get("reminder_recurrence")
+        recurrence = None
+        if isinstance(recurrence_raw, dict):
+            recurrence = ReminderRecurrence(
+                frequency=str(recurrence_raw.get("frequency", "weekly")),
+                interval=int(recurrence_raw.get("interval", 1)),
+                weekday=int(recurrence_raw.get("weekday", 0)),
+                count=int(recurrence_raw.get("count", 0)),
+            )
+        task = TaskDraft(
+            title=str(raw.get("title", ""))[:300],
+            due_date=str(raw.get("due_date", ""))[:10],
+            due_time=str(raw.get("due_time", ""))[:5],
+            priority=str(raw.get("priority", "none"))[:20],
+            category=str(raw.get("category", ""))[:100],
+            tags=tuple(str(item)[:50] for item in raw.get("tags", [])[:5]),
+            description=str(raw.get("description", ""))[:2000],
+            reminder_at=str(raw.get("reminder_at", ""))[:40],
+            reminder_recurrence=recurrence,
+        )
+        reason_raw = str(row["reason"])
+        try:
+            reason = ClarificationReason(reason_raw)
+        except ValueError:
+            reason = ClarificationReason.SEMANTIC_MISMATCH
+        return PendingTaskClarification(
+            reason=reason,
+            task=task,
+            reminder_date=str(row["reminder_date"]),
+            reminder_time=str(row["reminder_time"]),
+            source_message_id=str(row["source_message_id"]),
+        )
+
+    def set_pending_task(
+        self,
+        conversation_key: str,
+        pending: PendingTaskClarification,
+        expires_at: datetime,
+    ) -> None:
+        conversation_hash = self._hash(conversation_key)
+        updated_at = self._now()
+        with self._lock:
+            self._purge_expired_pending_tasks_locked(datetime.now(timezone.utc))
+            self._connection.execute(
+                """
+                INSERT INTO pending_task_clarifications(
+                    conversation_hash, reason, draft_json, reminder_date,
+                    reminder_time, source_message_id, state,
+                    claimed_by_message_id, expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '', ?, ?)
+                ON CONFLICT(conversation_hash) DO UPDATE SET
+                    reason = excluded.reason,
+                    draft_json = excluded.draft_json,
+                    reminder_date = excluded.reminder_date,
+                    reminder_time = excluded.reminder_time,
+                    source_message_id = excluded.source_message_id,
+                    state = 'pending',
+                    claimed_by_message_id = '',
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                WHERE pending_task_clarifications.state = 'pending'
+                """,
+                (
+                    conversation_hash,
+                    pending.reason.value,
+                    self._pending_draft_json(pending),
+                    pending.reminder_date,
+                    pending.reminder_time,
+                    pending.source_message_id[:300],
+                    expires_at.astimezone(timezone.utc).isoformat()
+                    if expires_at.tzinfo is not None
+                    else expires_at.replace(tzinfo=timezone.utc).isoformat(),
+                    updated_at,
+                ),
+            )
+
+    def claim_pending_task(
+        self,
+        conversation_key: str,
+        message_id: str,
+        now: datetime,
+    ) -> PendingTaskClaim:
+        conversation_hash = self._hash(conversation_key)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT * FROM pending_task_clarifications
+                    WHERE conversation_hash = ?
+                    """,
+                    (conversation_hash,),
+                ).fetchone()
+                if row is None:
+                    self._purge_expired_pending_tasks_locked(now)
+                    self._connection.execute("COMMIT")
+                    return PendingTaskClaim(None)
+                if self._pending_expired(row["expires_at"], now):
+                    self._connection.execute(
+                        "DELETE FROM pending_task_clarifications WHERE conversation_hash = ?",
+                        (conversation_hash,),
+                    )
+                    self._purge_expired_pending_tasks_locked(now)
+                    self._connection.execute("COMMIT")
+                    return PendingTaskClaim(None, "expired")
+                # Clean other silent conversations as part of any clarification
+                # activity while preserving the live target row.
+                self._purge_expired_pending_tasks_locked(
+                    now, exclude_conversation_hash=conversation_hash
+                )
+                if str(row["state"]) != "pending":
+                    self._connection.execute("COMMIT")
+                    return PendingTaskClaim(None, str(row["state"]))
+                self._connection.execute(
+                    """
+                    UPDATE pending_task_clarifications
+                    SET state = 'claimed', claimed_by_message_id = ?, updated_at = ?
+                    WHERE conversation_hash = ? AND state = 'pending'
+                    """,
+                    (message_id[:300], self._now(), conversation_hash),
+                )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+        try:
+            return PendingTaskClaim(self._pending_from_row(row), "claimed")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            self.clear_pending_task(conversation_key)
+            return PendingTaskClaim(None, "invalid")
+
+    def release_pending_task(
+        self,
+        conversation_key: str,
+        message_id: str,
+        pending: PendingTaskClarification | None = None,
+    ) -> bool:
+        conversation_hash = self._hash(conversation_key)
+        assignments = "state = 'pending', claimed_by_message_id = '', updated_at = ?"
+        parameters: list[object] = [self._now()]
+        if pending is not None:
+            assignments += ", reason = ?, draft_json = ?, reminder_date = ?, reminder_time = ?"
+            parameters.extend(
+                (
+                    pending.reason.value,
+                    self._pending_draft_json(pending),
+                    pending.reminder_date,
+                    pending.reminder_time,
+                )
+            )
+        parameters.extend((conversation_hash, message_id[:300]))
+        with self._lock:
+            cursor = self._connection.execute(
+                f"""
+                UPDATE pending_task_clarifications SET {assignments}
+                WHERE conversation_hash = ? AND state = 'claimed'
+                  AND claimed_by_message_id = ?
+                """,
+                tuple(parameters),
+            )
+        return cursor.rowcount == 1
+
+    def mark_pending_task_uncertain(
+        self, conversation_key: str, message_id: str
+    ) -> None:
         with self._lock:
             self._connection.execute(
                 """
-                UPDATE task_context SET task_status = 'completed'
-                WHERE sender_hash = ? AND task_id = ?
+                UPDATE pending_task_clarifications
+                SET state = 'uncertain', draft_json = '{}', reason = '',
+                    reminder_date = '', reminder_time = '', source_message_id = '',
+                    updated_at = ?
+                WHERE conversation_hash = ? AND claimed_by_message_id = ?
                 """,
-                (sender_hash, task_id),
+                (self._now(), self._hash(conversation_key), message_id[:300]),
             )
+
+    def complete_pending_task(self, conversation_key: str, message_id: str) -> None:
+        with self._lock:
             self._connection.execute(
                 """
-                UPDATE reminders SET status = 'cancelled'
-                WHERE task_id = ? AND status IN ('pending', 'failed', 'delivering')
+                DELETE FROM pending_task_clarifications
+                WHERE conversation_hash = ? AND claimed_by_message_id = ?
                 """,
-                (task_id,),
+                (self._hash(conversation_key), message_id[:300]),
             )
+
+    def clear_pending_task(self, conversation_key: str) -> None:
+        with self._lock:
+            self._connection.execute(
+                "DELETE FROM pending_task_clarifications WHERE conversation_hash = ?",
+                (self._hash(conversation_key),),
+            )
+
+    def abandon_pending_task(self, conversation_key: str) -> None:
+        """Let a clearly new request replace only an unclaimed clarification."""
+
+        with self._lock:
+            self._connection.execute(
+                """
+                DELETE FROM pending_task_clarifications
+                WHERE conversation_hash = ? AND state = 'pending'
+                """,
+                (self._hash(conversation_key),),
+            )
+
+    def mark_task_completed(self, sender_key: str, task_id: str) -> None:
+        sender_hash = self._hash(sender_key)
+        route = sender_key.split(":", 2)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._connection.execute(
+                    """
+                    UPDATE task_context SET task_status = 'completed'
+                    WHERE sender_hash = ? AND task_id = ?
+                    """,
+                    (sender_hash, task_id),
+                )
+                if len(route) == 3:
+                    self._connection.execute(
+                        """
+                        UPDATE reminders SET status = 'cancelled'
+                        WHERE task_id = ? AND platform = ? AND account_id = ?
+                          AND user_id = ?
+                          AND status IN ('pending', 'failed', 'delivering')
+                        """,
+                        (task_id, route[0], route[1], route[2]),
+                    )
+                else:
+                    self._connection.execute(
+                        """
+                        UPDATE reminders SET status = 'cancelled'
+                        WHERE task_id = ?
+                          AND status IN ('pending', 'failed', 'delivering')
+                        """,
+                        (task_id,),
+                    )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    def _reminder_route(row: sqlite3.Row) -> tuple[str, str, str, str]:
+        return (
+            str(row["platform"]),
+            str(row["account_id"]),
+            str(row["user_id"]),
+            str(row["chat_id"]),
+        )
+
+    def enqueue_reminders(
+        self,
+        message: MessageEnvelope,
+        task: TaskReference,
+        reminder_ats: Iterable[datetime],
+        *,
+        replace_existing: bool = False,
+    ) -> tuple[int, tuple[int, ...]]:
+        """Atomically enqueue a finite reminder series.
+
+        The existing `(task_id, reminder_at)` key remains the durable
+        idempotency boundary. A collision from another delivery route is
+        rejected instead of silently transferring the reminder to that route.
+        """
+
+        reminder_texts = tuple(item.isoformat() for item in reminder_ats)
+        if not reminder_texts:
+            raise ValueError("提醒时间不能为空")
+        if len(set(reminder_texts)) != len(reminder_texts):
+            raise ValueError("提醒时间不能重复")
+        if not task.task_id:
+            raise ValueError("提醒缺少稳定 task_id")
+
+        route = (message.platform, message.account_id, message.user_id, message.chat_id)
+        placeholders = ", ".join("?" for _ in reminder_texts)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing_rows = self._connection.execute(
+                    f"""
+                    SELECT * FROM reminders
+                    WHERE task_id = ? AND reminder_at IN ({placeholders})
+                    """,
+                    (task.task_id, *reminder_texts),
+                ).fetchall()
+                existing = {
+                    str(row["reminder_at"]): row for row in existing_rows
+                }
+                for row in existing_rows:
+                    if self._reminder_route(row) != route:
+                        raise ReminderRouteConflictError(
+                            "相同任务和时间已绑定到其他微信会话"
+                        )
+
+                if replace_existing:
+                    protected_statuses = {
+                        str(row["status"])
+                        for row in existing_rows
+                    }
+                    if not protected_statuses or not protected_statuses.issubset(
+                        {"sent", "cancelled"}
+                    ):
+                        self._connection.execute(
+                            f"""
+                            UPDATE reminders SET status = 'rescheduled'
+                            WHERE task_id = ?
+                              AND platform = ? AND account_id = ?
+                              AND user_id = ? AND chat_id = ?
+                              AND reminder_at NOT IN ({placeholders})
+                              AND status IN ('pending', 'failed', 'delivering')
+                            """,
+                            (
+                                task.task_id,
+                                *route,
+                                *reminder_texts,
+                            ),
+                        )
+
+                changed = 0
+                row_ids: list[int] = []
+                for reminder_text in reminder_texts:
+                    row = existing.get(reminder_text)
+                    if row is None:
+                        cursor = self._connection.execute(
+                            """
+                            INSERT INTO reminders(
+                                task_id, title, category, project_id, platform,
+                                account_id, user_id, chat_id, source_message_id,
+                                reminder_at, status, next_attempt_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                            """,
+                            (
+                                task.task_id,
+                                task.title[:500],
+                                task.category[:200],
+                                task.project_id[:300],
+                                *route,
+                                message.message_id,
+                                reminder_text,
+                                reminder_text,
+                            ),
+                        )
+                        changed += 1
+                        row_ids.append(int(cursor.lastrowid))
+                        continue
+
+                    row_id = int(row["id"])
+                    row_ids.append(row_id)
+                    self._connection.execute(
+                        """
+                        UPDATE reminders SET title = ?, category = ?, project_id = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            task.title[:500],
+                            task.category[:200],
+                            task.project_id[:300],
+                            row_id,
+                        ),
+                    )
+                    if replace_existing and str(row["status"]) in {
+                        "failed",
+                        "rescheduled",
+                    }:
+                        activation = self._connection.execute(
+                            """
+                            UPDATE reminders SET status = 'pending',
+                                next_attempt_at = ?, last_error_code = '',
+                                source_message_id = ?
+                            WHERE id = ? AND status IN ('failed', 'rescheduled')
+                            """,
+                            (reminder_text, message.message_id, row_id),
+                        )
+                        changed += activation.rowcount
+
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+        return changed, tuple(row_ids)
 
     def enqueue_reminder(
         self,
@@ -651,85 +1119,42 @@ class IdempotencyLedger:
         *,
         replace_existing: bool = False,
     ) -> tuple[bool, int]:
-        reminder_text = reminder_at.isoformat()
+        changed, row_ids = self.enqueue_reminders(
+            message,
+            task,
+            (reminder_at,),
+            replace_existing=replace_existing,
+        )
+        return changed > 0, row_ids[0]
+
+    def active_reminder_count(
+        self,
+        task_id: str,
+        message: MessageEnvelope | None = None,
+    ) -> int:
+        route_clause = ""
+        parameters: tuple[object, ...] = (task_id,)
+        if message is not None:
+            route_clause = (
+                " AND platform = ? AND account_id = ? AND user_id = ? AND chat_id = ?"
+            )
+            parameters = (
+                task_id,
+                message.platform,
+                message.account_id,
+                message.user_id,
+                message.chat_id,
+            )
         with self._lock:
-            self._connection.execute("BEGIN IMMEDIATE")
-            try:
-                if replace_existing:
-                    self._connection.execute(
-                        """
-                        UPDATE reminders SET status = 'rescheduled'
-                        WHERE task_id = ? AND reminder_at != ?
-                          AND status IN ('pending', 'failed', 'delivering')
-                        """,
-                        (task.task_id, reminder_text),
-                    )
-                cursor = self._connection.execute(
-                    """
-                    INSERT OR IGNORE INTO reminders(
-                        task_id, title, category, project_id, platform, account_id,
-                        user_id, chat_id, source_message_id, reminder_at, status,
-                        next_attempt_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-                    """,
-                    (
-                        task.task_id,
-                        task.title[:500],
-                        task.category[:200],
-                        task.project_id[:300],
-                        message.platform,
-                        message.account_id,
-                        message.user_id,
-                        message.chat_id,
-                        message.message_id,
-                        reminder_text,
-                        reminder_text,
-                    ),
-                )
-                created = cursor.rowcount == 1
-                reactivated = False
-                if cursor.rowcount == 0:
-                    self._connection.execute(
-                        """
-                        UPDATE reminders SET
-                            title = ?, category = ?, project_id = ?, platform = ?,
-                            account_id = ?, user_id = ?, chat_id = ?,
-                            source_message_id = ?
-                        WHERE task_id = ? AND reminder_at = ?
-                        """,
-                        (
-                            task.title[:500],
-                            task.category[:200],
-                            task.project_id[:300],
-                            message.platform,
-                            message.account_id,
-                            message.user_id,
-                            message.chat_id,
-                            message.message_id,
-                            task.task_id,
-                            reminder_text,
-                        ),
-                    )
-                    if replace_existing:
-                        activation = self._connection.execute(
-                            """
-                            UPDATE reminders SET status = 'pending',
-                                next_attempt_at = ?, last_error_code = ''
-                            WHERE task_id = ? AND reminder_at = ?
-                              AND status IN ('failed', 'rescheduled')
-                            """,
-                            (reminder_text, task.task_id, reminder_text),
-                        )
-                        reactivated = activation.rowcount == 1
-                row = self._connection.execute(
-                    "SELECT id FROM reminders WHERE task_id = ? AND reminder_at = ?",
-                    (task.task_id, reminder_text),
-                ).fetchone()
-                self._connection.execute("COMMIT")
-            except BaseException:
-                self._connection.execute("ROLLBACK")
-                raise
-        return created or reactivated, int(row["id"])
+            row = self._connection.execute(
+                """
+                SELECT COUNT(*) AS total FROM reminders
+                WHERE task_id = ? AND status IN ('pending', 'failed', 'delivering')
+                """
+                + route_clause,
+                parameters,
+            ).fetchone()
+        return int(row["total"]) if row is not None else 0
 
     def claim_due_reminders(
         self, now: datetime, *, limit: int = 100, stale_seconds: int = 600
@@ -741,10 +1166,11 @@ class IdempotencyLedger:
             try:
                 self._connection.execute(
                     """
-                    UPDATE reminders SET status = 'failed', next_attempt_at = ?
+                    UPDATE reminders SET status = 'uncertain',
+                        last_error_code = 'delivery-outcome-unknown'
                     WHERE status = 'delivering' AND last_attempt_at < ?
                     """,
-                    (now_text, stale_before),
+                    (stale_before,),
                 )
                 rows = self._connection.execute(
                     """
@@ -796,7 +1222,8 @@ class IdempotencyLedger:
                 self._connection.execute(
                     """
                     UPDATE reminders SET status = 'sent', delivered_at = ?,
-                        delivered_message_id = ?, last_error_code = '' WHERE id = ?
+                        delivered_message_id = ?, last_error_code = ''
+                    WHERE id = ? AND status IN ('pending', 'failed', 'delivering')
                     """,
                     (delivered_at.isoformat(), delivered_message_id[:300], int(row_id)),
                 )
@@ -812,9 +1239,43 @@ class IdempotencyLedger:
                 self._connection.execute(
                     """
                     UPDATE reminders SET status = 'failed', last_error_code = ?,
-                        next_attempt_at = ? WHERE id = ?
+                        next_attempt_at = ?
+                    WHERE id = ? AND status IN ('pending', 'failed', 'delivering')
                     """,
                     (error_code[:80], retry_at.isoformat(), int(row_id)),
+                )
+
+    def mark_reminders_uncertain(
+        self,
+        row_ids: Iterable[int],
+        error_code: str = "delivery-outcome-unknown",
+    ) -> None:
+        """Record an ambiguous send result as terminal and never auto-retry it.
+
+        The compare-and-set condition preserves a concurrent cancellation or
+        reschedule instead of allowing a late sender result to overwrite it.
+        """
+
+        safe_code = (
+            error_code
+            if error_code
+            in {
+                "delivery-timeout",
+                "delivery-cancelled",
+                "adapter-reported-failure",
+                "delivery-exception",
+                "delivery-outcome-unknown",
+            }
+            else "delivery-outcome-unknown"
+        )
+        with self._lock:
+            for row_id in row_ids:
+                self._connection.execute(
+                    """
+                    UPDATE reminders SET status = 'uncertain', last_error_code = ?
+                    WHERE id = ? AND status = 'delivering'
+                    """,
+                    (safe_code, int(row_id)),
                 )
 
     def reminder_status(self, task_id: str, reminder_at: datetime) -> str | None:

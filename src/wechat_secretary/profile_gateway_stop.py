@@ -63,6 +63,31 @@ def _recorded_pid_is_alive(home: Path) -> bool:
         return False
 
 
+def _begin_quiet_maintenance(home: Path) -> bool:
+    """Suppress only the redundant home-channel stop notice during maintenance."""
+
+    try:
+        from gateway.drain_control import write_drain_request
+
+        write_drain_request(
+            principal="wechat-secretary-maintenance",
+            suppress_notification=True,
+            home=home,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _end_quiet_maintenance(home: Path) -> None:
+    try:
+        from gateway.drain_control import clear_drain_request
+
+        clear_drain_request(home=home)
+    except Exception:
+        pass
+
+
 def main() -> int:
     configured = os.environ.get("HERMES_HOME", "")
     if not configured:
@@ -77,43 +102,48 @@ def main() -> int:
         print("not-running")
         return 0
 
+    quiet_maintenance = _begin_quiet_maintenance(home)
     try:
-        from gateway.status import write_planned_stop_marker
+        try:
+            from gateway.status import write_planned_stop_marker
 
-        write_planned_stop_marker(process.pid)
-    except Exception:
-        pass
+            write_planned_stop_marker(process.pid)
+        except Exception:
+            pass
 
-    deadline = time.monotonic() + 30.0
-    while time.monotonic() < deadline:
-        if not process.is_running():
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            if not process.is_running():
+                print("stopped")
+                return 0
+            try:
+                process.wait(timeout=0.5)
+                print("stopped")
+                return 0
+            except Exception as exc:
+                if exc.__class__.__module__.startswith("psutil"):
+                    continue
+                raise
+
+        # Re-read and revalidate the exact PID/start-time pair before escalation.
+        process = _validated_process(home)
+        if process is None:
             print("stopped")
             return 0
         try:
-            process.wait(timeout=0.5)
-            print("stopped")
-            return 0
+            process.kill()
+            process.wait(timeout=5.0)
         except Exception as exc:
-            if exc.__class__.__module__.startswith("psutil"):
-                continue
-            raise
-
-    # Re-read and revalidate the exact PID/start-time pair before escalation.
-    process = _validated_process(home)
-    if process is None:
+            if not exc.__class__.__module__.startswith("psutil"):
+                raise
+            if process.is_running():
+                print("profile gateway stop failed", file=sys.stderr)
+                return 1
         print("stopped")
         return 0
-    try:
-        process.kill()
-        process.wait(timeout=5.0)
-    except Exception as exc:
-        if not exc.__class__.__module__.startswith("psutil"):
-            raise
-        if process.is_running():
-            print("profile gateway stop failed", file=sys.stderr)
-            return 1
-    print("stopped")
-    return 0
+    finally:
+        if quiet_maintenance:
+            _end_quiet_maintenance(home)
 
 
 if __name__ == "__main__":

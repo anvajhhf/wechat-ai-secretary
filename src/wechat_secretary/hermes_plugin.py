@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import inspect
 import json
 import logging
 import os
@@ -18,7 +20,11 @@ from .models import MessageEnvelope
 from .obsidian import ObsidianExecutor
 from .path_security import source_reference
 from .private_inbox import PrivateInboxExecutor
-from .reminders import ReminderScheduler
+from .reminders import (
+    ReminderDeliveryPreSendError,
+    ReminderDeliveryUncertainError,
+    ReminderScheduler,
+)
 from .replies import add_dry_run_previews
 from .service import SecretaryService
 from .web_reader import SafeWebReader
@@ -111,22 +117,50 @@ def _reminder_sender(
     loop: asyncio.AbstractEventLoop, gateway: Any, record: Any, content: str
 ) -> str:
     adapter = _find_adapter(gateway, record.platform)
-    if adapter is None or not record.chat_id or loop.is_closed():
-        raise RuntimeError("weixin reminder route unavailable")
-    future = asyncio.run_coroutine_threadsafe(
-        adapter.send(
+    if adapter is None or not record.chat_id:
+        raise ReminderDeliveryPreSendError("route-unavailable")
+    if loop.is_closed():
+        raise ReminderDeliveryPreSendError("dispatch-loop-closed")
+    if getattr(adapter, "is_connected", None) is False:
+        raise ReminderDeliveryPreSendError("transport-not-ready")
+
+    try:
+        send_awaitable = adapter.send(
             chat_id=record.chat_id,
             content=content,
             reply_to=None,
             metadata=None,
-        ),
-        loop,
-    )
-    result = future.result(timeout=30)
+        )
+    except Exception:
+        # A non-standard synchronous adapter may already have performed side
+        # effects before raising, so absence of a returned awaitable is not
+        # sufficient proof that no message was sent.
+        raise ReminderDeliveryUncertainError("delivery-exception") from None
+    try:
+        future = asyncio.run_coroutine_threadsafe(send_awaitable, loop)
+    except Exception:
+        # The awaitable was never submitted to the event loop, so this is the
+        # one post-construction failure for which retry remains safe.
+        if inspect.iscoroutine(send_awaitable):
+            send_awaitable.close()
+        raise ReminderDeliveryPreSendError("dispatch-submit-failed") from None
+
+    try:
+        result = future.result(timeout=30)
+    except concurrent.futures.TimeoutError:
+        # Do not cancel: the platform operation may still finish.  Either way,
+        # its outcome cannot be proven here and an automatic retry is unsafe.
+        raise ReminderDeliveryUncertainError("delivery-timeout") from None
+    except concurrent.futures.CancelledError:
+        raise ReminderDeliveryUncertainError("delivery-cancelled") from None
+    except Exception:
+        raise ReminderDeliveryUncertainError("delivery-exception") from None
     if hasattr(result, "success") and not bool(result.success):
-        raise RuntimeError("weixin reminder delivery was not successful")
-    if isinstance(result, dict) and result.get("error"):
-        raise RuntimeError("weixin reminder delivery returned an error status")
+        raise ReminderDeliveryUncertainError("adapter-reported-failure")
+    if isinstance(result, dict) and (
+        result.get("success") is False or result.get("error")
+    ):
+        raise ReminderDeliveryUncertainError("adapter-reported-failure")
     if getattr(result, "message_id", None):
         return str(result.message_id)
     if isinstance(result, dict):
@@ -134,6 +168,45 @@ def _reminder_sender(
             if result.get(key):
                 return str(result[key])
     return ""
+
+
+def _attach_reminder_scheduler(
+    scheduler: ReminderScheduler,
+    loop: asyncio.AbstractEventLoop | None,
+    gateway: Any,
+) -> bool:
+    """Bind the live Weixin sender without making gateway readiness fragile."""
+
+    if loop is None or loop.is_closed() or _find_adapter(gateway, "weixin") is None:
+        return False
+    scheduler.attach(
+        lambda record, content: _reminder_sender(loop, gateway, record, content)
+    )
+    return True
+
+
+class GatewayReadyBridge:
+    """Attach reminder delivery as soon as Hermes exposes ready adapters."""
+
+    def __init__(self, scheduler: ReminderScheduler):
+        self.scheduler = scheduler
+
+    def __call__(
+        self,
+        gateway: Any,
+        loop: asyncio.AbstractEventLoop | None = None,
+        **kwargs: Any,
+    ) -> None:
+        del kwargs
+        ready_loop = loop or getattr(gateway, "_gateway_loop", None)
+        try:
+            if _attach_reminder_scheduler(self.scheduler, ready_loop, gateway):
+                logger.info("Wechat secretary reminder scheduler attached at gateway ready")
+        except Exception as exc:
+            logger.warning(
+                "Wechat secretary gateway-ready reminder attach failed: %s",
+                type(exc).__name__,
+            )
 
 
 class FailClosedBridge:
@@ -189,11 +262,9 @@ class GatewayBridge:
                 return {"action": "skip", "reason": "secretary-policy"}
             ref = source_reference(message)
             loop = asyncio.get_running_loop()
-            self.scheduler.attach(
-                lambda record, content: _reminder_sender(
-                    loop, gateway, record, content
-                )
-            )
+            # Fallback for older Hermes runtimes and adapters that reconnect
+            # after the one-shot gateway_ready hook.
+            _attach_reminder_scheduler(self.scheduler, loop, gateway)
             if not self._slots.acquire(blocking=False):
                 threading.Thread(
                     target=_schedule_reply,
@@ -325,6 +396,7 @@ def register(ctx: Any) -> None:
         )
         scheduler = ReminderScheduler(settings, ledger)
         bridge = GatewayBridge(service, scheduler)
+        ctx.register_hook("gateway_ready", GatewayReadyBridge(scheduler))
         ctx.register_hook("pre_gateway_dispatch", bridge)
 
         ctx.register_tool(

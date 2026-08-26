@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 from datetime import datetime
+from threading import Lock
 from typing import Any, Callable
 
 from .config import SecretarySettings
@@ -42,6 +43,113 @@ ALLOWED_TOOLS = READ_TOOLS | WRITE_TOOLS
 PRIORITY_VALUES = {"low": 1, "medium": 3, "high": 5}
 CREATE_APPROVAL_ENV = "SECRETARY_DIDA_CREATES_APPROVED"
 COMPLETE_APPROVAL_ENV = "SECRETARY_DIDA_COMPLETIONS_APPROVED"
+
+_CONNECTION_BEFORE_SEND_MARKERS = (
+    "unreachable",
+    "not connected",
+    "transport down",
+    "transport is down",
+    "failed initial connection",
+    "parked",
+    "connection refused",
+    "econnrefused",
+    "no route to host",
+    "尚未连接",
+    "未连接",
+    "无法连接",
+    "初始连接失败",
+)
+_UNCERTAIN_DELIVERY_MARKERS = (
+    "timeout",
+    "timed out",
+    "time out",
+    "deadline exceeded",
+    "mcp call failed",
+    "connection reset",
+    "connection closed",
+    "connection lost",
+    "session terminated",
+    "broken pipe",
+    "unexpected eof",
+    "end of file",
+    "cancelled",
+    "canceled",
+    "interrupted",
+)
+_BUSINESS_REJECTION_MARKERS = (
+    "rejected",
+    "invalid",
+    "validation",
+    "bad request",
+    "unauthorized",
+    "forbidden",
+    "permission denied",
+    "not permitted",
+    "not allowed",
+    "authentication failed",
+    "not found",
+    "duplicate",
+    "rate limit",
+    "too many requests",
+    "quota",
+    "拒绝",
+    "参数错误",
+    "参数无效",
+    "校验失败",
+    "验证失败",
+    "未授权",
+    "无权限",
+    "认证失败",
+    "鉴权失败",
+    "不存在",
+    "重复",
+    "限流",
+    "配额",
+)
+
+
+def _diagnostic_text(value: Any) -> str:
+    """Return bounded, case-folded diagnostic text for failure classification."""
+
+    if isinstance(value, BaseException):
+        parts: list[str] = []
+        current: BaseException | None = value
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            parts.append(f"{type(current).__name__}: {current}")
+            current = current.__cause__ or current.__context__
+        return " | ".join(parts).casefold()[:4000]
+    if isinstance(value, str):
+        return value.casefold()[:4000]
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str).casefold()[:4000]
+    except (TypeError, ValueError):
+        return str(value).casefold()[:4000]
+
+
+def _failure_kind(value: Any, *, raised: bool = False) -> str:
+    """Classify whether a failed write was sent before the failure surfaced."""
+
+    text = _diagnostic_text(value)
+    # These messages are emitted by Hermes before it dispatches tools/call.
+    # Check them before timeout because an initial connection failure may name
+    # TimeoutError while still proving that no write request was sent.
+    if any(marker in text for marker in _CONNECTION_BEFORE_SEND_MARKERS):
+        return "connection_before_send"
+    if isinstance(value, PermissionError):
+        return "local_rejection"
+    if isinstance(value, TimeoutError) or any(
+        marker in text for marker in _UNCERTAIN_DELIVERY_MARKERS
+    ):
+        return "uncertain"
+    if not raised and any(marker in text for marker in _BUSINESS_REJECTION_MARKERS):
+        return "business_rejection"
+    # An arbitrary exception does not establish whether the transport failed
+    # before or after dispatch.  In contrast, after the transport markers above
+    # have been excluded, Hermes' normal ok:false envelope represents a tool
+    # response and is therefore an explicit business rejection.
+    return "uncertain" if raised else "business_rejection"
 
 
 def _operator_approved(env_name: str) -> bool:
@@ -173,12 +281,14 @@ def _format_task_list(
     *,
     empty_text: str,
     limit: int = 8,
+    show_category: bool = True,
 ) -> str:
     if not refs:
         return empty_text
     lines = [heading]
     for index, ref in enumerate(refs[:limit], start=1):
-        lines.append(f"{index}. {ref.title}｜{ref.category or 'Inbox'}")
+        suffix = f"｜{ref.category or 'Inbox'}" if show_category else ""
+        lines.append(f"{index}. {ref.title}{suffix}")
     if len(refs) > limit:
         lines.append(f"另有 {len(refs) - limit} 项未展开")
     return "\n".join(lines)
@@ -188,14 +298,47 @@ class DidaExecutor:
     def __init__(self, settings: SecretarySettings, caller: McpCaller | None = None):
         self.settings = settings
         self._caller = caller
+        self._health_lock = Lock()
+        self._health: dict[str, str] = {
+            "status": "unknown",
+            "summary": "尚无滴答调用记录",
+            "updated_at": "",
+        }
+
+    def _record_health(self, status: str, summary: str) -> None:
+        snapshot = {
+            "status": status,
+            "summary": summary,
+            "updated_at": datetime.now(tz=self.settings.tz).isoformat(),
+        }
+        with self._health_lock:
+            self._health = snapshot
+
+    def health_summary(self) -> dict[str, str]:
+        """Return the latest lightweight Dida connectivity/outcome snapshot."""
+
+        with self._health_lock:
+            return dict(self._health)
 
     def _call(self, tool: str, arguments: dict[str, Any], timeout: float = 30) -> dict[str, Any]:
         if tool not in ALLOWED_TOOLS:
             raise PermissionError(f"滴答工具 {tool} 不在第一版允许列表中")
         if self._caller is None:
+            self._record_health("connection_fault", "滴答 MCP 尚未连接")
             raise RuntimeError("滴答 MCP 尚未连接")
-        envelope = self._caller(self.settings.dida_server, tool, arguments, timeout)
+        try:
+            envelope = self._caller(self.settings.dida_server, tool, arguments, timeout)
+        except Exception as exc:
+            kind = _failure_kind(exc, raised=True)
+            if kind == "connection_before_send":
+                self._record_health("connection_fault", "滴答连接故障，请求未发出")
+            elif kind == "local_rejection":
+                self._record_health("connection_fault", "滴答本地调用配置不可用")
+            else:
+                self._record_health("result_uncertain", "滴答调用结果不确定")
+            raise
         if not isinstance(envelope, dict):
+            self._record_health("result_uncertain", "滴答返回格式异常，调用结果不确定")
             raise TypeError("滴答 MCP 返回的不是结果对象")
         # Hermes exposes human-readable content as ``result`` and the
         # machine payload separately when an MCP response contains both.
@@ -206,6 +349,18 @@ class DidaExecutor:
         if structured is not None:
             envelope = dict(envelope)
             envelope["result"] = structured
+        if envelope.get("ok") is True:
+            self._record_health("recent_success", "最近一次滴答调用成功")
+        elif envelope.get("ok") is False:
+            kind = _failure_kind(envelope.get("error"))
+            if kind == "connection_before_send":
+                self._record_health("connection_fault", "滴答连接故障，请求未发出")
+            elif kind == "uncertain":
+                self._record_health("result_uncertain", "滴答调用结果不确定")
+            else:
+                self._record_health("recent_success", "滴答已响应，但请求被拒绝")
+        else:
+            self._record_health("result_uncertain", "滴答返回缺少状态，调用结果不确定")
         return envelope
 
     def taxonomy(self) -> dict[str, Any]:
@@ -300,49 +455,97 @@ class DidaExecutor:
         try:
             envelope = self._call("create_task", arguments, timeout=30)
         except Exception as exc:
+            kind = _failure_kind(exc, raised=True)
+            if kind == "connection_before_send":
+                return ActionResult(
+                    action="task",
+                    status=ExecutionStatus.FAILED,
+                    summary=task.title,
+                    destination=destination,
+                    error="滴答连接不可用，创建请求未发出，任务未创建。",
+                )
+            if kind == "local_rejection":
+                return ActionResult(
+                    action="task",
+                    status=ExecutionStatus.FAILED,
+                    summary=task.title,
+                    destination=destination,
+                    error="滴答创建请求在本地被阻止，任务未创建。",
+                )
+            self._record_health("result_uncertain", "滴答创建结果不确定")
             return ActionResult(
                 action="task",
                 status=ExecutionStatus.UNCERTAIN,
                 summary=task.title,
                 destination=destination,
-                error=f"滴答调用中断，未自动重试：{type(exc).__name__}",
+                error="无法确认滴答是否已创建该任务。请不要重试，以免重复创建。",
             )
         if envelope.get("ok") is not True:
+            kind = _failure_kind(envelope.get("error"))
+            if kind == "connection_before_send":
+                return ActionResult(
+                    action="task",
+                    status=ExecutionStatus.FAILED,
+                    summary=task.title,
+                    destination=destination,
+                    error="滴答连接不可用，创建请求未发出，任务未创建。",
+                )
+            if kind == "uncertain":
+                self._record_health("result_uncertain", "滴答创建结果不确定")
+                return ActionResult(
+                    action="task",
+                    status=ExecutionStatus.UNCERTAIN,
+                    summary=task.title,
+                    destination=destination,
+                    error="无法确认滴答是否已创建该任务。请不要重试，以免重复创建。",
+                )
             return ActionResult(
                 action="task",
                 status=ExecutionStatus.FAILED,
                 summary=task.title,
                 destination=destination,
-                error="滴答明确返回失败",
+                error="滴答明确拒绝创建请求，任务未创建。",
             )
         external_id = _extract_id(envelope.get("result"))
         if not external_id:
+            self._record_health("result_uncertain", "滴答创建结果不确定：成功响应缺少任务 ID")
             return ActionResult(
                 action="task",
                 status=ExecutionStatus.UNCERTAIN,
                 summary=task.title,
                 destination=destination,
-                error="滴答返回成功但没有 task_id，未记录为已创建",
+                error=(
+                    "滴答返回成功但没有 task_id，无法确认任务是否已创建。"
+                    "请不要重试，以免重复创建。"
+                ),
             )
         try:
             verification = self._call("get_task_by_id", {"task_id": external_id}, timeout=15)
             if verification.get("ok") is not True:
+                self._record_health("result_uncertain", "滴答创建结果不确定：回读核验失败")
                 return ActionResult(
                     action="task",
                     status=ExecutionStatus.UNCERTAIN,
                     summary=task.title,
                     destination=destination,
                     external_id=external_id,
-                    error="任务已返回 ID，但回读核验失败",
+                    error=(
+                        "任务已返回 ID，但回读核验失败，无法确认最终状态。"
+                        "请不要重试，以免重复创建。"
+                    ),
                 )
         except Exception:
+            self._record_health("result_uncertain", "滴答创建结果不确定：回读核验中断")
             return ActionResult(
                 action="task",
                 status=ExecutionStatus.UNCERTAIN,
                 summary=task.title,
                 destination=destination,
                 external_id=external_id,
-                error="任务可能已创建，但回读核验中断",
+                error=(
+                    "任务可能已创建，但回读核验中断。"
+                    "请不要重试，以免重复创建。"
+                ),
             )
         verified_node = _find_exact_task_node(verification.get("result"), external_id)
         expected_project_id = str(arguments["task"]["projectId"])
@@ -361,13 +564,17 @@ class DidaExecutor:
             or not project_matches
             or _node_is_completed(verified_node)
         ):
+            self._record_health("result_uncertain", "滴答创建结果不确定：回读内容不匹配")
             return ActionResult(
                 action="task",
                 status=ExecutionStatus.UNCERTAIN,
                 summary=task.title,
                 destination=destination,
                 external_id=external_id,
-                error="任务已返回 ID，但回读内容无法与该任务精确对应",
+                error=(
+                    "任务已返回 ID，但回读内容无法与该任务精确对应。"
+                    "请不要重试，以免重复创建。"
+                ),
             )
         reference = TaskReference(
             task_id=external_id,
@@ -376,6 +583,7 @@ class DidaExecutor:
             project_id=verified_project_id,
             status=str(verified_node.get("status") or ""),
         )
+        self._record_health("recent_success", "最近一次滴答创建已成功回读确认")
         return ActionResult(
             action="task",
             status=ExecutionStatus.SUCCEEDED,
@@ -584,46 +792,94 @@ class DidaExecutor:
         try:
             envelope = self._call("complete_task", arguments, timeout=30)
         except Exception as exc:
+            kind = _failure_kind(exc, raised=True)
+            if kind == "connection_before_send":
+                return ActionResult(
+                    action="complete",
+                    status=ExecutionStatus.FAILED,
+                    summary=task.title,
+                    destination=task.category or "Inbox",
+                    external_id=task.task_id,
+                    error="滴答连接不可用，完成请求未发出，任务未改动。",
+                )
+            if kind == "local_rejection":
+                return ActionResult(
+                    action="complete",
+                    status=ExecutionStatus.FAILED,
+                    summary=task.title,
+                    destination=task.category or "Inbox",
+                    external_id=task.task_id,
+                    error="滴答完成请求在本地被阻止，任务未改动。",
+                )
+            self._record_health("result_uncertain", "滴答完成结果不确定")
             return ActionResult(
                 action="complete",
                 status=ExecutionStatus.UNCERTAIN,
                 summary=task.title,
                 destination=task.category or "Inbox",
                 external_id=task.task_id,
-                error=f"完成调用中断，未自动重试：{type(exc).__name__}",
+                error="无法确认滴答任务是否已完成。请不要重试，以免重复操作。",
             )
         if envelope.get("ok") is not True:
+            kind = _failure_kind(envelope.get("error"))
+            if kind == "connection_before_send":
+                return ActionResult(
+                    action="complete",
+                    status=ExecutionStatus.FAILED,
+                    summary=task.title,
+                    destination=task.category or "Inbox",
+                    external_id=task.task_id,
+                    error="滴答连接不可用，完成请求未发出，任务未改动。",
+                )
+            if kind == "uncertain":
+                self._record_health("result_uncertain", "滴答完成结果不确定")
+                return ActionResult(
+                    action="complete",
+                    status=ExecutionStatus.UNCERTAIN,
+                    summary=task.title,
+                    destination=task.category or "Inbox",
+                    external_id=task.task_id,
+                    error="无法确认滴答任务是否已完成。请不要重试，以免重复操作。",
+                )
             return ActionResult(
                 action="complete",
                 status=ExecutionStatus.FAILED,
                 summary=task.title,
                 destination=task.category or "Inbox",
                 external_id=task.task_id,
-                error="滴答明确返回完成失败",
+                error="滴答明确拒绝完成请求，任务未改动。",
             )
         try:
             verification = self._call(
                 "get_task_by_id", {"task_id": task.task_id}, timeout=15
             )
         except Exception:
+            self._record_health("result_uncertain", "滴答完成结果不确定：回读核验中断")
             return ActionResult(
                 action="complete",
                 status=ExecutionStatus.UNCERTAIN,
                 summary=task.title,
                 destination=task.category or "Inbox",
                 external_id=task.task_id,
-                error="完成调用已返回，但回读核验中断",
+                error=(
+                    "完成调用已返回，但回读核验中断。"
+                    "请不要重试，以免重复操作。"
+                ),
             )
         if verification.get("ok") is not True or not _is_exact_completed_task(
             verification.get("result"), task.task_id, task.project_id
         ):
+            self._record_health("result_uncertain", "滴答完成结果不确定：回读未确认完成")
             return ActionResult(
                 action="complete",
                 status=ExecutionStatus.UNCERTAIN,
                 summary=task.title,
                 destination=task.category or "Inbox",
                 external_id=task.task_id,
-                error="回读未确认任务为已完成状态",
+                error=(
+                    "回读未确认任务为已完成状态。"
+                    "请不要重试，以免重复操作。"
+                ),
             )
         completed_ref = TaskReference(
             task_id=task.task_id,
@@ -632,6 +888,7 @@ class DidaExecutor:
             project_id=task.project_id,
             status="completed",
         )
+        self._record_health("recent_success", "最近一次滴答完成操作已成功回读确认")
         return ActionResult(
             action="complete",
             status=ExecutionStatus.SUCCEEDED,
@@ -656,6 +913,7 @@ class DidaExecutor:
                     result.task_refs,
                     empty_text="今天暂无未完成任务。",
                     limit=5,
+                    show_category=False,
                 )
                 if result.successful
                 else "抱歉，今日重点暂时没能生成：滴答查询没有成功。"

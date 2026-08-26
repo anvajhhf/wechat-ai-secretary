@@ -59,6 +59,12 @@ if (-not $Apply) {
     exit 0
 }
 
+# Cron 只投递真正的提醒正文，不附带任务名、内部 job_id 或英文管理提示。
+& $hermes config set cron.wrap_response false *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw "无法关闭 Cron 技术包装；为避免继续发送内部信息，本次未继续配置。"
+}
+
 $existing = (& $hermes cron list --all 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0) {
     throw "无法读取 $Profile 的现有 Cron；未创建任何新任务。"

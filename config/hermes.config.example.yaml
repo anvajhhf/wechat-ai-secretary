@@ -105,3 +105,7 @@ mcp_servers:
         - complete_task
       resources: false
       prompts: false
+
+# 微信只收到 Cron 的实际正文，不显示任务名、job_id 或英文管理提示。
+cron:
+  wrap_response: false

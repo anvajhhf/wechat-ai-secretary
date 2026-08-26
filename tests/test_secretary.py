@@ -25,7 +25,11 @@ from wechat_secretary.cli import (
 from wechat_secretary.config import SecretarySettings
 from wechat_secretary.dida import DidaExecutor
 from wechat_secretary.hermes_gateway_entry import main as gateway_entry_main
-from wechat_secretary.hermes_plugin import GatewayBridge, _json_tool_result
+from wechat_secretary.hermes_plugin import (
+    GatewayBridge,
+    GatewayReadyBridge,
+    _json_tool_result,
+)
 from wechat_secretary.ledger import IdempotencyLedger
 from wechat_secretary.media import (
     LocalMediaPreprocessor,
@@ -47,6 +51,8 @@ from wechat_secretary.models import (
 from wechat_secretary.obsidian import ObsidianExecutor
 from wechat_secretary.private_inbox import PrivateInboxExecutor
 from wechat_secretary.profile_gateway_stop import (
+    _begin_quiet_maintenance,
+    _end_quiet_maintenance,
     _validated_process,
     main as profile_stop_main,
 )
@@ -1050,6 +1056,36 @@ class LedgerPrivacyTests(unittest.TestCase):
 
 
 class PluginScopeTests(unittest.TestCase):
+    def test_gateway_ready_attaches_reminders_before_any_inbound_message(self) -> None:
+        scheduler = Mock()
+        ready = GatewayReadyBridge(scheduler)
+        gateway = SimpleNamespace(adapters={"weixin": object()})
+
+        async def invoke() -> None:
+            ready(gateway=gateway, loop=asyncio.get_running_loop())
+
+        asyncio.run(invoke())
+        scheduler.attach.assert_called_once()
+
+    def test_gateway_ready_attach_failure_is_best_effort(self) -> None:
+        scheduler = SimpleNamespace(attach=Mock(side_effect=RuntimeError("test")))
+        ready = GatewayReadyBridge(scheduler)
+        gateway = SimpleNamespace(adapters={"weixin": object()})
+
+        async def invoke() -> None:
+            ready(gateway=gateway, loop=asyncio.get_running_loop())
+
+        asyncio.run(invoke())
+
+    def test_gateway_ready_hook_is_supported_and_installed(self) -> None:
+        from hermes_cli.plugins import VALID_HOOKS
+
+        install_script = (ROOT / "scripts" / "install-local.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("gateway_ready", VALID_HOOKS)
+        self.assertIn("hermes-gateway-ready-hook.patch", install_script)
+
     def test_non_weixin_events_are_left_to_other_platforms(self) -> None:
         cfg = settings()
         fake_service = SimpleNamespace(
@@ -1071,7 +1107,7 @@ class PluginScopeTests(unittest.TestCase):
             settings=cfg,
             accepts=lambda incoming: True,
         )
-        scheduler = SimpleNamespace(attach=lambda sender: None)
+        scheduler = Mock()
         bridge = GatewayBridge(fake_service, scheduler)
         event = SimpleNamespace(
             source=SimpleNamespace(
@@ -1089,17 +1125,19 @@ class PluginScopeTests(unittest.TestCase):
         )
 
         async def invoke() -> dict[str, str]:
+            gateway = SimpleNamespace(adapters={"weixin": object()})
             with patch(
                 "wechat_secretary.hermes_plugin.threading.Thread",
                 thread_factory,
             ):
-                return bridge(event, SimpleNamespace())
+                return bridge(event, gateway)
 
         outcome = asyncio.run(invoke())
         self.assertEqual("secretary-handled", outcome["reason"])
         self.assertTrue(
             thread_factory.call_args.kwargs["name"].startswith("secretary-")
         )
+        scheduler.attach.assert_called_once()
 
     def test_pre_dispatch_failure_schedules_one_clear_failure_reply(self) -> None:
         cfg = settings()
@@ -1200,6 +1238,18 @@ class ProfileIsolationTests(unittest.TestCase):
 
 
 class GatewayProfileIsolationTests(unittest.TestCase):
+    def test_planned_maintenance_suppresses_only_redundant_stop_broadcast(self) -> None:
+        home = test_directory("quiet-maintenance")
+        marker = home / ".drain_request.json"
+
+        self.assertTrue(_begin_quiet_maintenance(home))
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertTrue(payload["suppress_notification"])
+        self.assertEqual("wechat-secretary-maintenance", payload["principal"])
+
+        _end_quiet_maintenance(home)
+        self.assertFalse(marker.exists())
+
     def test_gateway_entry_rejects_a_mismatched_home_marker(self) -> None:
         root = test_directory("gateway-entry-marker")
         configured = root / "owner"
@@ -2355,8 +2405,20 @@ class DigestTests(unittest.TestCase):
         executor = DidaExecutor(settings(dry_run=False), caller)
         text, refs = executor.scheduled_digest("morning", NOW)
         self.assertIn("今日重点", text)
-        self.assertIn("1. 提交报告｜工作", text)
+        self.assertIn("1. 提交报告", text)
+        self.assertNotIn("｜工作", text)
+        self.assertNotIn("Inbox", text)
         self.assertEqual(("today-1", "today-2"), tuple(ref.task_id for ref in refs))
+
+    def test_cron_configuration_disables_technical_response_wrapper(self) -> None:
+        example = (ROOT / "config" / "hermes.config.example.yaml").read_text(
+            encoding="utf-8"
+        )
+        configure_script = (ROOT / "scripts" / "configure-cron.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        self.assertIn("cron:\n  wrap_response: false", example)
+        self.assertIn("config set cron.wrap_response false", configure_script)
 
 
 class ReminderTests(unittest.TestCase):
@@ -2557,7 +2619,7 @@ class PartialRetryTests(unittest.TestCase):
         notes = self.CountingNotes()
         classifier = self.MixedClassifier()
         app, _, _ = service_with(classifier=classifier, dida=dida, obsidian=notes)
-        incoming = message("partial-1", "混合消息")
+        incoming = message("partial-1", "帮我记一下正文，另外明天提交任务A")
         first = app.handle(incoming)
         second = app.handle(incoming)
         third = app.handle(incoming)
@@ -2617,7 +2679,7 @@ class PartialRetryTests(unittest.TestCase):
             dida=dida,
             obsidian=notes,
         )
-        incoming = message("partial-preserve", "混合消息")
+        incoming = message("partial-preserve", "帮我记一下正文，另外明天提交任务A")
         first = app.handle(incoming)
         second = app.handle(incoming)
         context = ledger.recent_task_context(incoming.sender_key, NOW)
