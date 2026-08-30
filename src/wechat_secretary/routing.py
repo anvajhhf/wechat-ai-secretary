@@ -5,6 +5,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .models import IntentKind
+from .request_scope import (
+    INDEPENDENT_REQUEST_CONNECTOR_RE,
+    REMINDER_REQUEST_RE,
+    has_negated_reminder,
+    mask_quoted_text,
+    note_request_match,
+    outer_reminder_is_question,
+    outer_reminder_match,
+)
 
 
 class RouteSource(StrEnum):
@@ -64,38 +73,13 @@ _ACTION_SIGNAL = re.compile(
     r"买|购买|提交|联系|发送|准备|整理|预约|缴费|续费|取快递|打电话|回电话|"
     r"开会|参加|复查|看医生|吃药|接人|接孩子|带伞)"
 )
-_QUESTION_SIGNAL = re.compile(r"(?:怎么|如何|什么|哪些|为何|为什么|是否|吗|么|\?|？)")
+_QUESTION_SIGNAL = re.compile(
+    r"(?:怎么|如何|什么|哪些|为何|为什么|是否|有没有|要不要|会不会|是不是|吗|么|\?|？)"
+)
 
 _QUERY_SIGNAL = re.compile(
     r"(?:(?:查询|查一下|列出|看看|找一下).{0,12}(?:任务|待办|笔记)|"
     r"(?:任务|待办|笔记).{0,12}(?:有哪些|有什么|多少|在哪))"
-)
-_NOTE_REQUEST = re.compile(
-    r"^\s*(?:请|麻烦|帮我)?\s*(?:"
-    r"记一下|记下来|记录一下|记录下来|保存一下|保存这(?:段|条|个)?|"
-    r"存成(?:一篇|一个)?笔记|整理成(?:一篇|一个)?笔记|做个笔记)"
-)
-_NOTE_STATEMENT = re.compile(
-    r"^\s*(?:这是|以下是)?\s*(?:实验|会议|项目)?(?:结论|纪要|记录)\s*[：:,，]"
-)
-_REMINDER_REQUEST = re.compile(r"(?:(?:提醒|通知)我|到时候(?:提醒|通知|叫)我)")
-_REMINDER_STOP_INTENT = re.compile(
-    r"(?:(?:不要|不用|无需|不必|不需要|请勿|别)"
-    r"\s*(?:再)?\s*(?:提醒|通知|叫)(?:我)?|"
-    r"(?:取消|撤销|停止|关闭|删除|移除)"
-    r"[^，,。；;！？!?]{0,20}?(?:提醒|通知|叫)(?:我)?)"
-)
-_REMINDER_META_QUESTION = re.compile(
-    r"(?:为什么|为何|是否|是不是|会不会|你会|是否会|什么时候|何时|几点|怎么|如何)"
-)
-_POLITE_REMINDER_QUESTION = re.compile(
-    r"(?:^\s*(?:(?:请|麻烦|劳驾)(?!问)|(?:你\s*)?(?:能否|可否|能不能|可不可以|能|可以))"
-    r".{0,80}(?:提醒我|到时候(?:提醒|叫)我)|"
-    r"(?:提醒我|到时候(?:提醒|叫)我).{0,80}(?:可以|行|好|没问题)(?:吗|么)?\s*[?？]?\s*$)"
-)
-_EXPLICIT_REQUEST_LEAD = re.compile(
-    r"(?:^|[，,。；;！？!?])\s*(?:请(?!问)|麻烦|劳驾|帮我|记得|别忘了|不要忘记|"
-    r"安排(?:一下)?|让|(?:你\s*)?(?:能否|可否|能不能|可不可以|能|可以))"
 )
 _REMINDER_STATUS_DESCRIPTION = re.compile(
     r"(?:(?:已经|早已|刚才|刚刚|刚).{0,40}(?:提醒|通知|叫)(?:过)?我|"
@@ -145,21 +129,34 @@ _SUBJECT_TIME_ACTION_STATEMENT = re.compile(
     r".{0,40}(?:提醒|通知|叫|买|购买|提交|联系|发送|准备|整理|预约|缴费|续费|"
     r"回复|完成|打电话|回电话|开会|参加|复查|看医生|吃药|接人|接孩子)"
 )
-_MIXED_CONNECTOR = re.compile(r"(?:另外|同时|并且|还有|顺便)")
 _CLAUSE_CONNECTOR_PREFIX = re.compile(
     r"((?:^|[，,。；;！？!?])\s*)(?:另外|同时|并且|还有|顺便)\s*"
 )
 
 
+def _unquoted_text(text: str) -> str:
+    """Mask quoted content without changing offsets into the original text."""
+
+    return mask_quoted_text(text)
+
+
+def _outer_reminder_match(text: str) -> re.Match[str] | None:
+    return outer_reminder_match(text)
+
+
+def _outer_reminder_is_question(text: str, match: re.Match[str]) -> bool:
+    return outer_reminder_is_question(text, match)
+
+
 def has_task_or_time_signal(text: str) -> bool:
     """Return true only for a reasonably strong task or temporal signal."""
 
-    candidate = (text or "").strip()
+    candidate = _unquoted_text(text or "").strip()
     if not candidate:
         return False
-    if _REMINDER_STOP_INTENT.search(candidate):
+    if has_negated_reminder(text):
         return False
-    if _DATE_OR_TIME_SIGNAL.search(candidate) or _REMINDER_REQUEST.search(candidate):
+    if _DATE_OR_TIME_SIGNAL.search(candidate) or REMINDER_REQUEST_RE.search(candidate):
         return True
     if _QUESTION_SIGNAL.search(candidate):
         return False
@@ -169,27 +166,23 @@ def has_task_or_time_signal(text: str) -> bool:
 def is_non_action_task_utterance(text: str) -> bool:
     """Identify questions or subject-led statements that must not authorize writes."""
 
-    candidate = (text or "").strip()
+    candidate = _unquoted_text(text or "").strip()
     if not candidate:
         return False
-    if _REMINDER_STOP_INTENT.search(candidate):
+    if has_negated_reminder(text):
         return True
 
-    raw_reminder_request = bool(
-        _REMINDER_REQUEST.search(candidate)
-    )
+    outer_reminder = _outer_reminder_match(text)
+    if outer_reminder is not None:
+        # Once an explicit outer reminder command is identified, questions and
+        # reported statements inside its payload describe the future task.
+        return _outer_reminder_is_question(text, outer_reminder)
+
+    raw_reminder_request = bool(REMINDER_REQUEST_RE.search(candidate))
     if raw_reminder_request:
-        question_like = bool(_QUESTION_SIGNAL.search(candidate))
-        polite_question = bool(_POLITE_REMINDER_QUESTION.search(candidate))
-        if question_like and (
-            _REMINDER_META_QUESTION.search(candidate) or not polite_question
-        ):
-            return True
-        if (
-            _REMINDER_STATUS_DESCRIPTION.search(candidate)
-            and not _EXPLICIT_REQUEST_LEAD.search(candidate)
-        ):
-            return True
+        # Without a recognized outer command, a mention of a reminder could
+        # be forwarded text, a report, or a question. It is not write consent.
+        return True
 
     # Discourse connectors do not become grammatical subjects.  Strip only a
     # connector at a clause boundary, then rerun the subject test: “另外明天提交”
@@ -253,7 +246,43 @@ def detect_route_hint(
     if not candidate:
         return RouteHint(kind=None, normalized_text=normalized.text)
 
-    if _QUERY_SIGNAL.search(candidate):
+    unquoted_candidate = _unquoted_text(candidate)
+    note_match = note_request_match(candidate)
+    if note_match is not None:
+        # The note owns its body, including lookup/reminder/cancellation words.
+        # Only a separate, explicitly connected task clause creates MIXED.
+        body = candidate[note_match.end():]
+        for connector in INDEPENDENT_REQUEST_CONNECTOR_RE.finditer(_unquoted_text(body)):
+            tail = body[connector.end():]
+            if detect_route_hint(tail).kind is IntentKind.TASK:
+                return RouteHint(
+                    kind=IntentKind.MIXED,
+                    source=RouteSource.NATURAL,
+                    confidence=0.9,
+                    evidence=("note-request", "task-request", "mixed-connector"),
+                    normalized_text=normalized.text,
+                )
+        return RouteHint(
+            kind=IntentKind.NOTE,
+            source=RouteSource.NATURAL,
+            confidence=0.95,
+            evidence=("note-request",),
+            normalized_text=normalized.text,
+        )
+
+    query_match = _QUERY_SIGNAL.search(unquoted_candidate)
+    reminder_match = REMINDER_REQUEST_RE.search(unquoted_candidate)
+    outer_reminder = _outer_reminder_match(candidate)
+    scoped_reminder_request = bool(
+        outer_reminder is not None
+        and not _outer_reminder_is_question(candidate, outer_reminder)
+        and not has_negated_reminder(candidate)
+    )
+    # A lookup after a reminder marker belongs to its payload, even when the
+    # outer utterance is a rejected question/negation about that reminder.
+    if query_match is not None and not scoped_reminder_request and (
+        reminder_match is None or query_match.start() < reminder_match.start()
+    ):
         return RouteHint(
             kind=IntentKind.QUERY,
             source=RouteSource.NATURAL,
@@ -262,15 +291,14 @@ def detect_route_hint(
             normalized_text=normalized.text,
         )
 
-    note_request = bool(_NOTE_REQUEST.search(candidate) or _NOTE_STATEMENT.search(candidate))
     raw_reminder_request = bool(
-        _REMINDER_REQUEST.search(candidate)
-        and not _REMINDER_STOP_INTENT.search(candidate)
+        outer_reminder
+        and not has_negated_reminder(candidate)
     )
-    question_like = bool(_QUESTION_SIGNAL.search(candidate))
-    reminder_status_description = bool(_REMINDER_STATUS_DESCRIPTION.search(candidate))
+    question_like = bool(_QUESTION_SIGNAL.search(unquoted_candidate))
+    reminder_status_description = bool(_REMINDER_STATUS_DESCRIPTION.search(unquoted_candidate))
     status_description = bool(
-        _STATUS_DESCRIPTION.search(candidate) or reminder_status_description
+        _STATUS_DESCRIPTION.search(unquoted_candidate) or reminder_status_description
     )
     blocked_task_statement = is_non_action_task_utterance(candidate)
     reminder_request = bool(
@@ -278,14 +306,14 @@ def detect_route_hint(
         and not blocked_task_statement
     )
     leading_action_request = bool(
-        _LEADING_ACTION_REQUEST.search(candidate) and has_task_or_time_signal(candidate)
+        _LEADING_ACTION_REQUEST.search(unquoted_candidate) and has_task_or_time_signal(candidate)
     )
-    explicit_task_creation = bool(_EXPLICIT_TASK_CREATION.search(candidate))
+    explicit_task_creation = bool(_EXPLICIT_TASK_CREATION.search(unquoted_candidate))
     inferred_task_request = bool(
         explicit_task_creation
         or leading_action_request
-        or _TEMPORAL_ACTION.search(candidate)
-        or _ACTION_THEN_TEMPORAL.search(candidate)
+        or _TEMPORAL_ACTION.search(unquoted_candidate)
+        or _ACTION_THEN_TEMPORAL.search(unquoted_candidate)
     )
     task_request = bool(
         reminder_request
@@ -297,27 +325,7 @@ def detect_route_hint(
         )
     )
 
-    if note_request and task_request and _MIXED_CONNECTOR.search(candidate):
-        return RouteHint(
-            kind=IntentKind.MIXED,
-            source=RouteSource.NATURAL,
-            confidence=0.9,
-            evidence=("note-request", "task-request", "mixed-connector"),
-            normalized_text=normalized.text,
-        )
-
-    # An explicit note-taking request owns its clause. This prevents words such
-    # as “提交” inside “记录一下周五要提交的材料” from forcing a task route.
-    if note_request and not reminder_request:
-        return RouteHint(
-            kind=IntentKind.NOTE,
-            source=RouteSource.NATURAL,
-            confidence=0.95,
-            evidence=("note-request",),
-            normalized_text=normalized.text,
-        )
-
-    if task_request and not note_request:
+    if task_request:
         evidence = "reminder-request" if reminder_request else "task-request"
         return RouteHint(
             kind=IntentKind.TASK,

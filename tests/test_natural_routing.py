@@ -362,7 +362,7 @@ class NaturalServiceRoutingTests(unittest.TestCase):
         result = service.handle(incoming)
 
         self.assertEqual(1, len(dida.create_calls))
-        self.assertIs(classifier.forced_kinds[0], IntentKind.TASK)
+        self.assertEqual(0, classifier.call_count)
         self.assertEqual(["task", "reminder"], [item.action for item in result.results])
         self.assertEqual(
             "pending",
@@ -1069,7 +1069,7 @@ class RecurringReminderTests(unittest.TestCase):
 
                 self.assertEqual(ExecutionStatus.SKIPPED, first.status)
                 self.assertIn("星期几", first.reply)
-                self.assertEqual(1, classifier.call_count)
+                self.assertEqual(0, classifier.call_count)
                 self.assertEqual(1, len(dida.create_calls))
                 self.assertEqual("买牛奶", dida.create_calls[0].title)
                 self.assertEqual(3, ledger.active_reminder_count("task-1", source))

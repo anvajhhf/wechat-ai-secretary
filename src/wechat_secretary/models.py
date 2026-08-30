@@ -144,6 +144,9 @@ class PendingTaskClarification:
     reminder_date: str = ""
     reminder_time: str = ""
     source_message_id: str = ""
+    # "ambiguous" means conflicting periods still need explicit clarification.
+    reminder_period: str = ""
+    last_received_at: str = ""
 
 
 @dataclass(frozen=True)

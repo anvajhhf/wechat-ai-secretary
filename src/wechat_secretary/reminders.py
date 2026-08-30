@@ -89,6 +89,7 @@ class ReminderQueue:
         message: MessageEnvelope,
         *,
         replace_existing: bool = False,
+        expected_snapshot: tuple[tuple[object, ...], ...] | None = None,
     ) -> ActionResult:
         try:
             reminder_at = datetime.fromisoformat(draft.reminder_at)
@@ -163,6 +164,7 @@ class ReminderQueue:
                 task,
                 reminder_ats,
                 replace_existing=replace_existing,
+                expected_snapshot=expected_snapshot,
             )
         except ReminderRouteConflictError:
             return ActionResult(
@@ -277,6 +279,13 @@ class ReminderScheduler:
         first = records[0]
         sender_key = f"{first.platform}:{first.account_id}:{first.user_id}"
         self.ledger.record_task_context(
+            f"{sender_key}:{first.chat_id}",
+            (record.task for record in records),
+            batch_id=batch_id, source_message_id=delivered_message_id or batch_id,
+            observed_at=now, ttl_seconds=self.settings.completion_context_ttl_seconds,
+            context_kind="reminder", reminder_at=min(record.reminder_at for record in records),
+        )
+        self.ledger.record_task_context(
             sender_key,
             (record.task for record in records),
             batch_id=batch_id,
@@ -295,6 +304,8 @@ class ReminderScheduler:
         now: datetime,
         batch_id: str,
     ) -> str:
+        if not self.ledger.begin_reminder_delivery(record.row_id for record in records):
+            return "skipped"
         try:
             delivered_message_id = sender(records[0], content) or ""
         except ReminderDeliveryPreSendError as exc:

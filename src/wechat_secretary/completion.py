@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import StrEnum
+
+from .temporal import RELATIVE_TOKEN_RE, resolve_datetime, resolve_relative_time
 
 
 class CompletionKind(StrEnum):
@@ -66,12 +68,13 @@ def parse_relative_reminder(text: str, now: datetime) -> datetime | None:
     """Parse only a standalone adjustment such as “半小时后提醒”."""
 
     compact = _TRAILING_PUNCTUATION.sub("", re.sub(r"\s+", "", text or "").strip())
-    matched = re.fullmatch(r"(半|\d{1,3})(分钟|小时)后(?:再)?提醒(?:我)?", compact)
+    matched = re.fullmatch(r"(.+?)(?:再)?提醒(?:我)?", compact)
     if not matched:
         return None
-    amount = 0.5 if matched[1] == "半" else int(matched[1])
-    delta = timedelta(hours=amount) if matched[2] == "小时" else timedelta(minutes=amount)
-    return now + delta
+    schedule = matched[1]
+    if not RELATIVE_TOKEN_RE.fullmatch(schedule):
+        return None
+    return resolve_relative_time(schedule, now)
 
 
 def parse_named_reminder(text: str, now: datetime) -> NamedReminderDecision | None:
@@ -90,37 +93,7 @@ def parse_named_reminder(text: str, now: datetime) -> NamedReminderDecision | No
     if not title:
         return None
 
-    exact = re.fullmatch(
-        r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})[ T]([01]?\d|2[0-3])[:：]([0-5]\d)",
-        when_text,
-    )
-    if exact:
-        try:
-            reminder_at = datetime(
-                int(exact[1]),
-                int(exact[2]),
-                int(exact[3]),
-                int(exact[4]),
-                int(exact[5]),
-                tzinfo=now.tzinfo,
-            )
-        except ValueError:
-            return None
-        return NamedReminderDecision(title=title, reminder_at=reminder_at)
-
-    relative = re.fullmatch(
-        r"(今天|明天|后天)\s*([01]?\d|2[0-3])[:：]([0-5]\d)", when_text
-    )
-    if not relative:
+    reminder_at = resolve_datetime(when_text, now)
+    if reminder_at is None:
         return None
-    days = {"今天": 0, "明天": 1, "后天": 2}[relative[1]]
-    target_date = now.date() + timedelta(days=days)
-    reminder_at = datetime(
-        target_date.year,
-        target_date.month,
-        target_date.day,
-        int(relative[2]),
-        int(relative[3]),
-        tzinfo=now.tzinfo,
-    )
     return NamedReminderDecision(title=title, reminder_at=reminder_at)

@@ -52,6 +52,36 @@ def _find_adapter(gateway: Any, platform: str) -> Any | None:
     return None
 
 
+def _event_text(event: Any, platform: str) -> str:
+    """Remove only a raw-payload-verified Weixin transcription wrapper."""
+
+    text = str(getattr(event, "text", "") or "")
+    raw_message = getattr(event, "raw_message", None)
+    if platform != "weixin" or not isinstance(raw_message, dict):
+        return text
+    items = raw_message.get("item_list")
+    if not isinstance(items, list) or len(items) != 1:
+        return text
+    item = items[0]
+    if not isinstance(item, dict) or item.get("type") != 3:
+        return text
+    voice = item.get("voice_item")
+    if not isinstance(voice, dict):
+        return text
+    media = voice.get("media")
+    if media is not None and media != {}:
+        return text
+    transcript = voice.get("text")
+    if not isinstance(transcript, str) or not transcript:
+        return text
+
+    # With no downloaded audio, the current Weixin adapter labels its STT
+    # fallback as TEXT, not VOICE. Verify the raw item and the entire text so
+    # typed lookalikes or debounced/combined messages are never rewritten.
+    wrapper = "[Voice transcription provided by Weixin]\n"
+    return transcript if text == wrapper + transcript else text
+
+
 def _event_to_message(event: Any, settings: SecretarySettings) -> MessageEnvelope:
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", ""))
@@ -73,7 +103,7 @@ def _event_to_message(event: Any, settings: SecretarySettings) -> MessageEnvelop
         chat_id=str(getattr(source, "chat_id", "") or ""),
         chat_type=str(getattr(source, "chat_type", "") or ""),
         message_id=str(getattr(event, "message_id", "") or ""),
-        text=str(getattr(event, "text", "") or ""),
+        text=_event_text(event, platform),
         received_at=timestamp,
         media_paths=media_paths,
         media_types=media_types,
