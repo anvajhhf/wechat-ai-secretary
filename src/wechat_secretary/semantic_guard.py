@@ -119,7 +119,7 @@ def _reminder_marker(text: str) -> re.Match[str] | None:
 
 def _split_leading_schedule(value: str) -> tuple[str, str]:
     """Separate a leading schedule from payload without scanning its body."""
-    candidate = value.strip(" ，,。；;！？!?：:、")
+    candidate = value.strip(" \t\r\n，,。.；;！？!?：:、")
     fragments: list[str] = []
     while candidate:
         updated = re.sub(r"^(?:在|从|到时候)\s*", "", candidate, count=1)
@@ -134,24 +134,24 @@ def _split_leading_schedule(value: str) -> tuple[str, str]:
                 if pattern is _TASK_TIME_CONTROL_RE and re.match(
                     r"水|估计|透视", updated[found.end():]
                 ) and not found["period"]:
-                    return candidate, " ".join(fragments)
+                    return candidate, "，".join(fragments)
                 fragments.append(found.group())
                 candidate = re.sub(
                     r"^\s*(?:的时候|时候)?\s*(?:开始)?\s*"
-                    r"(?:(?:[，,、；;和及]|或者|或)\s*)*",
+                    r"(?:(?:[，,。.、；;！!和及]|或者|或)\s*)*",
                     "", updated[found.end():],
                 )
                 break
         else:
             break
-    return candidate, " ".join(fragments)
+    return candidate, "，".join(fragments)
 
 
 def _split_trailing_schedule(value: str) -> tuple[str, str]:
-    candidate = value.strip(" ，,。；;！？!?：:、")
+    candidate = value.strip(" \t\r\n，,。.；;！？!?：:、")
     candidate = re.sub(
         r"(?:(?:请你|请|务必|一定要|一定|记得|帮我|麻烦|劳驾)\s*)+$", "", candidate
-    ).rstrip(" ，,、；;")
+    ).rstrip(" ，,。.、；;")
     fragments: list[str] = []
     while candidate:
         for pattern in (
@@ -164,20 +164,61 @@ def _split_trailing_schedule(value: str) -> tuple[str, str]:
             if found:
                 fragments.insert(0, found.group())
                 candidate = re.sub(
-                    r"(?:(?:[\s，,、；;和及]|或者|或))+$", "", candidate[:found.start()]
+                    r"(?:(?:[\s，,。.、；;！!和及]|或者|或))+$", "", candidate[:found.start()]
                 )
                 break
         else:
             break
-    return candidate, " ".join(fragments)
+    return candidate, "，".join(fragments)
+
+
+def _split_schedule_suffix(value: str) -> tuple[str, str]:
+    """Extract only independently delimited, entirely temporal tail clauses.
+
+    Body sentences such as '查看明天下午的会议安排' and quoted times stay
+    untouched. A final '下午四点半' is a schedule refinement, not task content.
+    """
+    candidate = value.rstrip(" \t\r\n。.!！")
+    fragments: list[str] = []
+    while candidate:
+        boundaries = list(re.finditer(r"[，,。;；、\n]|(?<!\d)\.|\.(?!\d)", mask_quoted_text(candidate)))
+        if not boundaries:
+            break
+        boundary = boundaries[-1]
+        tail = candidate[boundary.end():].strip()
+        if mask_quoted_text(tail) != tail:
+            break
+        remainder, schedule = _split_leading_schedule(tail)
+        if not schedule or remainder.strip(" \t\r\n。.!！，,；;、"):
+            break
+        fragments.insert(0, schedule)
+        candidate = candidate[:boundary.start()].rstrip()
+    return candidate, "，".join(fragments)
+
+
+def _reminder_body_source(text: str) -> str:
+    marker = _reminder_marker(text)
+    if marker is None:
+        return text
+    body, _ = _split_leading_schedule(text[marker.end():])
+    body, _ = _split_schedule_suffix(body)
+    if len(_compact_grounding_text(body)) < 2:
+        body, _ = _split_trailing_schedule(text[:marker.start()])
+    return body
+
+
+def has_compound_reminder_body(text: str) -> bool:
+    """Time punctuation is not a separator between independent task bodies."""
+    return bool(_STRONG_MULTI_TASK_SEPARATOR_RE.search(_reminder_body_source(text)))
 
 
 def _reminder_schedule_source(text: str) -> str:
     marker = _reminder_marker(text)
     if marker:
         _, before = _split_trailing_schedule(text[:marker.start()])
-        _, after = _split_leading_schedule(text[marker.end():])
-        return f"{before} 提醒我 {after}"
+        body, after = _split_leading_schedule(text[marker.end():])
+        _, tail = _split_schedule_suffix(body)
+        return f"{before} 提醒我 {after}，{tail}"
     # Quoted text never supplies scheduling fields on its own.
     return mask_quoted_text(text)
 
@@ -243,7 +284,6 @@ def extract_task_semantics(
 ) -> TaskSemanticSignals:
     schedule = _reminder_schedule_source(text)
     requested_date = _resolve_date(schedule, now)
-    requested_time = _resolve_time(schedule, default_period=default_period)
     date_tokens = [
         found.group() for found in _TASK_DATE_CONTROL_RE.finditer(schedule)
         if not found.group().startswith("每")
@@ -251,11 +291,21 @@ def extract_task_semantics(
         and not _UNSUPPORTED_RECURRENCE_RE.fullmatch(found.group())
     ]
     parsed_dates = [_resolve_date(token, now) for token in date_tokens]
+    if parsed_dates and all(parsed_dates) and len(set(parsed_dates)) == 1:
+        requested_date = parsed_dates[0]
     invalid_date = any(not parsed for parsed in parsed_dates)
     clock_tokens = list(CLOCK_TOKEN_RE.finditer(schedule))
     periods = tuple(dict.fromkeys(found.group() for found in PERIOD_TOKEN_RE.finditer(schedule)))
+    inherited_period = default_period if PERIOD_TOKEN_RE.fullmatch(default_period) else ""
+    clock_period = periods[0] if len(periods) == 1 else inherited_period
+    clock_values = [
+        "" if re.match(r"[.：:]|秒|刻|分|点|小时|时间|时长", schedule[found.end():]) else
+        _resolve_time(found.group(), default_period=clock_period)
+        for found in clock_tokens
+    ]
+    requested_time = clock_values[0] if clock_values and all(clock_values) and len(set(clock_values)) == 1 else ""
     date_conflict = len(set(parsed_dates)) > 1
-    clock_conflict = len(clock_tokens) > 1 or len(periods) > 1
+    clock_conflict = (len(clock_tokens) > 1 and (not all(clock_values) or len(set(clock_values)) > 1)) or len(periods) > 1
     conflicting_schedule = date_conflict or clock_conflict
     if invalid_date or date_conflict:
         requested_date = ""
@@ -295,6 +345,26 @@ def extract_task_semantics(
         date_conflict = clock_conflict = True
         requested_date = requested_time = relative = ""
     identifiers = tuple(dict.fromkeys(match.group(0) for match in _IDENTIFIER_RE.finditer(text)))
+    explicit_24h = any(
+        found["colon"] or (value and (int(value[:2]) == 0 or int(value[:2]) >= 13))
+        for found, value in zip(clock_tokens, clock_values)
+    )
+    reminder_period = (
+        periods[0] if len(periods) == 1 else "ambiguous" if len(periods) > 1 else
+        _period_for_clock(requested_time) if requested_time and explicit_24h else
+        inherited_period if requested_time and inherited_period else
+        "unknown" if requested_time and clock_tokens else ""
+    )
+    if default_period == "ambiguous" and not periods and not explicit_24h:
+        requested_time, reminder_period = "", "ambiguous"
+    # Infer only the current day's still-future, unambiguous time. A bare 4:30
+    # expressed as '四点半' is NOT evidence that the user meant early morning.
+    if (requests_reminder and not recurrence_requested and not date_tokens
+        and requested_time and reminder_period not in {"", "unknown", "ambiguous"}
+        and not conflicting_schedule and not relative):
+        today_at = datetime.fromisoformat(f"{now.date().isoformat()}T{requested_time}").replace(tzinfo=now.tzinfo)
+        if today_at > now:
+            requested_date = now.date().isoformat()
     return TaskSemanticSignals(
         requests_reminder=requests_reminder,
         negated_reminder=negated_reminder,
@@ -314,11 +384,7 @@ def extract_task_semantics(
         conflicting_schedule=conflicting_schedule,
         date_conflict=date_conflict,
         clock_conflict=clock_conflict,
-        reminder_period=(
-            periods[0] if len(periods) == 1 else
-            "ambiguous" if len(periods) > 1 else
-            _period_for_clock(requested_time) if requested_time and clock_tokens else ""
-        ),
+        reminder_period=reminder_period,
         complex_recurrence=complex_recurrence,
     )
 
@@ -415,6 +481,7 @@ def _deterministic_task_title(text: str) -> str:
     suffix = source[marker.end() :] if marker else ""
 
     candidate = _split_leading_schedule(suffix)[0] if marker else ""
+    candidate, _ = _split_schedule_suffix(candidate)
     candidate = re.sub(r"^一下\s*", "", candidate)
     candidate = re.sub(r"^一次(?=.{2,})", "", candidate)
     candidate = re.sub(
@@ -515,17 +582,42 @@ def _source_priority(text: str) -> str:
     return {"高": "high", "中": "medium", "低": "low"}.get(next(iter(levels)), "none")
 
 
+def _source_category(text: str, candidate: str) -> str:
+    if not candidate:
+        return ""
+    # A category name inside a title, quote or negative instruction is not
+    # permission to move the task into that category.
+    lead = r"(?:(?:请|麻烦|帮我)\s*)?(?:(?:把|将)\s*)?(?:(?:这个|这项|该)?(?:任务|待办)(?:的)?\s*)?"
+    setting = r"(?:分类|清单)\s*(?:设为|设置为|是|为|[：:])\s*|(?:归入|归到|归类到|放入|放到)\s*"
+    pattern = re.compile(rf"{lead}(?:{setting})(?P<category>.+?)(?:清单|分类)?")
+    categories: set[str] = set()
+    rejected: set[str] = set()
+    expected = _compact_grounding_text(candidate)
+    for clause in re.split(r"[，,。；;！？!?\n]", mask_quoted_text(text)):
+        clause = clause.strip()
+        # Retain the established comma-separated shorthand '…, 高优先级，工作'.
+        # Only an entire unquoted clause can be a shorthand category label.
+        if _compact_grounding_text(clause) == expected:
+            categories.add(expected)
+            continue
+        matched = pattern.fullmatch(clause)
+        if matched:
+            categories.add(_compact_grounding_text(matched.group("category")))
+            continue
+        negated = re.fullmatch(
+            rf"{lead}(?:(?:分类|清单)\s*)?(?:不要|不用|不是|别|无需)\s*"
+            rf"(?:{setting})?(?P<category>.+?)(?:清单|分类)?", clause,
+        )
+        if negated:
+            rejected.add(_compact_grounding_text(negated.group("category")))
+    return candidate if categories == {expected} and expected not in rejected else ""
+
+
 def _sanitize_task_metadata(text: str, task: TaskDraft) -> TaskDraft:
-    source = _compact_grounding_text(text)
-    category = (
-        task.category
-        if task.category and _compact_grounding_text(task.category) in source
-        else ""
-    )
     return replace(
         task,
         priority=_source_priority(text),
-        category=category,
+        category=_source_category(text, task.category),
         tags=(),
         description="",
     )
@@ -728,6 +820,10 @@ def validate_plan_semantics(
             "我没有识别到明确的创建或记录请求，因此没有写入。若要执行，请直接说“明天下午3点提醒我回电话”或“帮我记一下……”。",
         )
 
+    if plan.kind is IntentKind.QUERY and expected_kind is not IntentKind.QUERY:
+        return _clarify(plan, ClarificationReason.AMBIGUOUS_INTENT,
+                        "我没有识别到当前的任务查询请求，因此没有读取任务。请说明要查询的范围或关键词。")
+
     if expected_kind is IntentKind.QUERY:
         if (
             plan.kind is IntentKind.CLARIFY
@@ -800,7 +896,7 @@ def validate_plan_semantics(
         not plan.tasks
         and expected_kind is IntentKind.TASK
         and signals.requests_reminder
-        and not _STRONG_MULTI_TASK_SEPARATOR_RE.search(text)
+        and not has_compound_reminder_body(text)
     ):
         # A model clarification must not discard an explicit, source-grounded
         # reminder body. Rebuild only the locally authorized single task; the
@@ -951,6 +1047,11 @@ def validate_plan_semantics(
                 reminder_time=signals.requested_time,
                 reminder_period=signals.reminder_period,
             )
+        if signals.requested_time and signals.reminder_period == "unknown":
+            return _clarify(plan, ClarificationReason.MISSING_REMINDER_TIME,
+                            "事项和重复次数已保留。这个钟点是上午还是下午？",
+                            pending_task, reminder_date=recurrence_start_date,
+                            reminder_time=signals.requested_time, reminder_period="unknown")
         if not signals.requested_time:
             return _clarify(
                 plan,
@@ -996,6 +1097,11 @@ def validate_plan_semantics(
         return GuardDecision(_with_task(plan, task))
 
     if signals.requests_reminder:
+        if signals.requested_time and signals.reminder_period == "unknown":
+            return _clarify(plan, ClarificationReason.MISSING_REMINDER_TIME,
+                            "事项和钟点已记住。你说的是上午还是下午？",
+                            task, reminder_date=signals.requested_date,
+                            reminder_time=signals.requested_time, reminder_period="unknown")
         reminder_at = signals.relative_reminder_at
         if not reminder_at:
             if not signals.requested_date and not signals.requested_time:
@@ -1219,6 +1325,11 @@ def resume_pending_task(
         else signals.requested_time or pending.reminder_time
     )
     reminder_date = signals.requested_date if signals.date_supplied else pending.reminder_date
+    if (pending.reminder_period == "unknown" and pending.reminder_time
+        and signals.reminder_period and PERIOD_TOKEN_RE.fullmatch(signals.reminder_period)
+        and not CLOCK_TOKEN_RE.search(text) and not signals.clock_conflict):
+        hour, minute = map(int, pending.reminder_time.split(":"))
+        reminder_time = _resolve_time(f"{signals.reminder_period}{hour}点{minute}分")
     if signals.relative_reminder_at:
         relative = datetime.fromisoformat(signals.relative_reminder_at)
         reminder_date, reminder_time = relative.date().isoformat(), relative.strftime("%H:%M")
@@ -1286,12 +1397,12 @@ def resume_pending_task(
             )
         weekday_text = _WEEKDAY_TEXT.get(weekday, "")
         start = f"{reminder_date} 开始，" if reminder_date else ""
-        clock = reminder_time or (period if period != "ambiguous" else "")
+        clock = _pending_clock_text(reminder_time, period)
         canonical = (
             f"{start}每周{weekday_text} {clock}提醒我{task.title}，共{count}次"
         )
     else:
-        clock = reminder_time or (period if period != "ambiguous" else "")
+        clock = _pending_clock_text(reminder_time, period)
         canonical = f"{reminder_date} {clock}提醒我{task.title}"
     plan = IntentPlan(kind=IntentKind.TASK, tasks=(task,), confidence=1.0)
     decision = validate_plan_semantics(canonical, plan, now, expected_kind=IntentKind.TASK)
@@ -1303,3 +1414,10 @@ def resume_pending_task(
             last_received_at=pending.last_received_at,
         ))
     return decision
+
+
+def _pending_clock_text(clock: str, period: str) -> str:
+    if clock and period == "unknown":
+        hour, minute = map(int, clock.split(":"))
+        return f"{hour}点{minute}分"
+    return clock or (period if period not in {"unknown", "ambiguous"} else "")

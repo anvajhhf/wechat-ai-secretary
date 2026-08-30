@@ -81,6 +81,17 @@ _QUERY_SIGNAL = re.compile(
     r"(?:(?:查询|查一下|列出|看看|找一下).{0,12}(?:任务|待办|笔记)|"
     r"(?:任务|待办|笔记).{0,12}(?:有哪些|有什么|多少|在哪))"
 )
+_QUERY_REQUEST_PREFIX = re.compile(
+    r"^(?:\s|[，,：:]|请(?!问)|麻烦|劳驾|拜托|帮(?:一下)?我|你|"
+    r"我(?:想|要)(?:知道)?|(?:能否|可否|能不能|可不可以|可以|能)|"
+    r"今天|今日|明天|明日|后天|本周|这周|下周|未来七天|未来7天|"
+    r"(?:我|今天|明天|本周|这周|下周)的|所有|全部|未完成|待完成|已完成)*$"
+)
+_QUERY_META_DESCRIPTION = re.compile(
+    r"(?:查询|检索|搜索)(?:任务|待办|笔记)(?:的)?(?:接口|API|代码|语法|原理|教程|方法)|"
+    r"(?:任务|待办|笔记)(?:查询|检索|搜索)(?:的)?(?:接口|API|代码|语法|原理|教程|方法)|"
+    r"(?:如何|怎么)(?:查(?:询)?|检索|搜索|使用)|是什么(?:意思)?|是什么意思"
+)
 _REMINDER_STATUS_DESCRIPTION = re.compile(
     r"(?:(?:已经|早已|刚才|刚刚|刚).{0,40}(?:提醒|通知|叫)(?:过)?我|"
     r"(?:^|[，,。；;！？!?])\s*[^，,。；;！？!?]{0,30}?"
@@ -146,6 +157,21 @@ def _outer_reminder_match(text: str) -> re.Match[str] | None:
 
 def _outer_reminder_is_question(text: str, match: re.Match[str]) -> bool:
     return outer_reminder_is_question(text, match)
+
+
+def _outer_query_match(text: str) -> re.Match[str] | None:
+    """A read request, not a quoted/reported mention of looking up tasks."""
+
+    candidate = _unquoted_text(text)
+    match = _QUERY_SIGNAL.search(candidate)
+    if (
+        match is None
+        or candidate[:match.start()] != text[:match.start()]
+        or not _QUERY_REQUEST_PREFIX.fullmatch(candidate[:match.start()])
+        or _QUERY_META_DESCRIPTION.search(candidate)
+    ):
+        return None
+    return match
 
 
 def has_task_or_time_signal(text: str) -> bool:
@@ -270,7 +296,7 @@ def detect_route_hint(
             normalized_text=normalized.text,
         )
 
-    query_match = _QUERY_SIGNAL.search(unquoted_candidate)
+    query_match = _outer_query_match(candidate)
     reminder_match = REMINDER_REQUEST_RE.search(unquoted_candidate)
     outer_reminder = _outer_reminder_match(candidate)
     scoped_reminder_request = bool(

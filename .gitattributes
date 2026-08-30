@@ -1,5 +1,7 @@
 * text=auto
 *.patch text eol=lf
+# Unified patches need a single-space prefix on empty context lines.
+*.patch whitespace=-blank-at-eol
 *.py text eol=lf
 *.ps1 text eol=lf
 *.toml text eol=lf

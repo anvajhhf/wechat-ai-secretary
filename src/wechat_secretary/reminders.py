@@ -354,7 +354,11 @@ class ReminderScheduler:
         for route_records in routes.values():
             old = tuple(record for record in route_records if record.reminder_at < threshold)
             recent = tuple(record for record in route_records if record.reminder_at >= threshold)
-            if old:
+            # Each marked-sent occurrence must actually appear in a delivered
+            # message. Bounded chunks keep transport payloads small without
+            # hiding later entries behind an "another N items" count.
+            for offset in range(0, len(old), 10):
+                chunk = old[offset:offset + 10]
                 entries = [
                     (
                         record.reminder_at.astimezone(self.settings.tz).strftime(
@@ -362,28 +366,25 @@ class ReminderScheduler:
                         ),
                         record.task.title,
                     )
-                    for record in old[:10]
+                    for record in chunk
                 ]
-                remainder = len(old) - len(entries)
                 content = (
                     "抱歉，以下提醒未按时送达，我现在补给你（原计划时间如下）：\n"
                     + "\n".join(
                         f"- {planned_at}｜{title}" for planned_at, title in entries
                     )
                 )
-                if remainder:
-                    content += f"\n- 另有 {remainder} 项"
                 outcome = self._deliver_group(
                     sender,
-                    old,
+                    chunk,
                     content,
                     now,
-                    "reminder-merged:" + ",".join(str(item.row_id) for item in old),
+                    "reminder-merged:" + ",".join(str(item.row_id) for item in chunk),
                 )
-                sent += len(old) if outcome == "sent" else 0
-                failed += len(old) if outcome == "failed" else 0
-                uncertain += len(old) if outcome == "uncertain" else 0
-                merged += 1
+                sent += len(chunk) if outcome == "sent" else 0
+                failed += len(chunk) if outcome == "failed" else 0
+                uncertain += len(chunk) if outcome == "uncertain" else 0
+                merged += 1 if outcome != "skipped" else 0
             for record in recent:
                 title = record.task.title.strip().rstrip("。！!？?，,；; ") or "这件事"
                 content = f"提醒你一下，别忘了{title}。"

@@ -433,6 +433,11 @@ class NaturalServiceRoutingTests(unittest.TestCase):
                     self.assertIsNotNone(pending.pending)
                     self.assertEqual(expected, pending.pending.task.title)
                 else:
+                    if result.status is ExecutionStatus.SKIPPED:
+                        self.assertIn("上午", result.reply)
+                        pending = ledger.peek_pending_task(make_message("probe", "").conversation_key, NOW)
+                        self.assertEqual(expected, pending.task.title)
+                        service.handle(make_message(f"date-word-period-{index}", "下午", NOW + timedelta(seconds=1)))
                     self.assertEqual(expected, dida.create_calls[0].title)
 
     def test_unrelated_natural_task_title_is_rejected_before_write(self) -> None:
@@ -535,6 +540,10 @@ class NaturalServiceRoutingTests(unittest.TestCase):
         result = service.handle(
             make_message("explicit-forget-reminder", "明天3点别忘了提交报告")
         )
+        self.assertEqual(ExecutionStatus.SKIPPED, result.status)
+        self.assertEqual([], dida.create_calls)
+        self.assertIn("上午", result.reply)
+        result = service.handle(make_message("explicit-forget-period", "凌晨", NOW + timedelta(seconds=1)))
 
         expected = datetime.fromisoformat("2026-08-25T03:00+08:00")
         self.assertEqual("提交报告", dida.create_calls[0].title)

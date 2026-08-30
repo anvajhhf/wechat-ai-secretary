@@ -50,6 +50,17 @@ def main() -> int:
     except OSError:
         return 2
 
+    # The secretary owns per-message safety/ordering. Its adapter must not
+    # silently merge messages or drop fresh replies that repeat earlier text.
+    # The compatibility patch leaves ordinary Hermes launches unchanged.
+    try:
+        from gateway.platforms.weixin import WECHAT_SECRETARY_STRICT_INGRESS_SUPPORTED
+    except ImportError:
+        return 2
+    if WECHAT_SECRETARY_STRICT_INGRESS_SUPPORTED is not True:
+        return 2
+    os.environ["WECHAT_SECRETARY_STRICT_INGRESS"] = "1"
+
     # Keep the marker in the operating-system command line so Hermes' process
     # scanner can distinguish the two custom homes, but hide it from its parser.
     del sys.argv[1:3]

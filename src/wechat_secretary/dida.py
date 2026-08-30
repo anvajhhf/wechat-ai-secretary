@@ -235,6 +235,29 @@ def _find_exact_task_node(value: Any, task_id: str) -> dict[str, Any] | None:
     return None
 
 
+def _requested_create_fields_match(expected: dict[str, Any], actual: dict[str, Any]) -> bool:
+    """Verify user-specified fields using the existing readback, not a new call."""
+    if "dueDate" in expected:
+        value = actual.get("dueDate")
+        if not isinstance(value, str) or type(actual.get("isAllDay")) is not bool:
+            return False
+        try:
+            actual_due = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            expected_due = datetime.fromisoformat(expected["dueDate"])
+        except (TypeError, ValueError):
+            return False
+        # An offset-free date cannot prove the intended instant. UTC and
+        # local-offset representations of the same instant are equivalent.
+        if (actual_due.tzinfo is None or actual_due != expected_due
+                or actual["isAllDay"] != expected["isAllDay"]):
+            return False
+    if "priority" in expected and (
+        type(actual.get("priority")) is not int or actual["priority"] != expected["priority"]
+    ):
+        return False
+    return True
+
+
 def _node_is_completed(value: dict[str, Any]) -> bool:
     """Accept completion evidence only from the task object itself."""
 
@@ -574,6 +597,19 @@ class DidaExecutor:
                 error=(
                     "任务已返回 ID，但回读内容无法与该任务精确对应。"
                     "请不要重试，以免重复创建。"
+                ),
+            )
+        if not _requested_create_fields_match(arguments["task"], verified_node):
+            self._record_health("result_uncertain", "滴答创建结果不确定：截止时间或优先级未核实")
+            return ActionResult(
+                action="task",
+                status=ExecutionStatus.UNCERTAIN,
+                summary=task.title,
+                destination=destination,
+                external_id=external_id,
+                error=(
+                    "任务已返回 ID，但截止时间或优先级未能回读确认。"
+                    "请在滴答中检查；不要重试，以免重复创建。"
                 ),
             )
         reference = TaskReference(

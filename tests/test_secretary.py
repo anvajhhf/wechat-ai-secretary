@@ -1962,6 +1962,9 @@ class DidaWriteContractTests(unittest.TestCase):
                     "title": "提交报告",
                     "projectId": "opaque-inbox-id",
                     "status": 0,
+                    "dueDate": "2026-08-25T07:00:00Z",
+                    "isAllDay": False,
+                    "priority": 5,
                 },
             }
 
@@ -2171,7 +2174,7 @@ class CompletionTests(unittest.TestCase):
             TaskReference("task-2", "提交预算", "工作"),
         )
         ledger.record_task_context(
-            message("source", "").sender_key,
+            message("source", "").conversation_key,
             refs,
             batch_id="reminder-batch",
             source_message_id="outbound-1",
@@ -2228,7 +2231,7 @@ class CompletionTests(unittest.TestCase):
     def test_context_expiry_never_guesses(self) -> None:
         app, _, ledger = service_with()
         ledger.record_task_context(
-            message("source", "").sender_key,
+            message("source", "").conversation_key,
             (TaskReference("task-old", "旧任务", "工作"),),
             batch_id="old",
             source_message_id="outbound-old",

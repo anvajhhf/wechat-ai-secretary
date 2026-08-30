@@ -47,6 +47,7 @@ from .semantic_guard import (
     looks_like_pending_followup,
     looks_like_pending_body,
     extract_task_semantics,
+    has_compound_reminder_body,
     resume_pending_task,
     validate_plan_semantics,
 )
@@ -312,12 +313,19 @@ class SecretaryService:
         now: datetime,
     ) -> HandlingResult:
         limited = refs[:10]
-        self.ledger.set_pending_completion(
-            message.sender_key,
+        stored = self.ledger.set_pending_completion(
+            message.conversation_key,
             limited,
             message.message_id,
             now + timedelta(seconds=self.settings.completion_confirmation_ttl_seconds),
+            observed_at=now,
         )
+        if not stored:
+            self.ledger.finish(message, ExecutionStatus.SKIPPED, error_code="completion-choice-stale")
+            return HandlingResult(
+                status=ExecutionStatus.SKIPPED,
+                reply="这条请求早于当前确认列表，没有覆盖较新的任务；请按最新列表确认。",
+            )
         lines = ["我找到了以下可能的任务，请确认要完成哪一个："]
         lines.extend(
             f"{index}. {ref.title}｜{ref.category or 'Inbox'}"
@@ -336,7 +344,9 @@ class SecretaryService:
     def _resolve_named_completion(
         self, message: MessageEnvelope, title: str, now: datetime
     ) -> tuple[TaskReference, ...]:
-        local = self.ledger.find_task_context(message.sender_key, title, now)
+        if self.ledger.has_newer_matching_task_context(message.conversation_key, title, now):
+            return ()
+        local = self.ledger.find_task_context(message.conversation_key, title, now)
         if local:
             return local
         remote = self.dida.search_task_references(title)
@@ -356,7 +366,7 @@ class SecretaryService:
         )
         if result.status in {ExecutionStatus.PLANNED, ExecutionStatus.SUCCEEDED}:
             self.ledger.mark_task_completed(message.sender_key, task.task_id, conversation_key=message.conversation_key)
-            self.ledger.clear_pending_completion(message.sender_key)
+            self.ledger.clear_pending_completion(message.conversation_key)
         return self._finalize(message, [result])
 
     def _handle_completion(
@@ -385,7 +395,7 @@ class SecretaryService:
 
         refs: tuple[TaskReference, ...] = ()
         if decision.kind is CompletionKind.RECENT:
-            context = self.ledger.recent_task_context(message.sender_key, now)
+            context = self.ledger.recent_task_context(message.conversation_key, now)
             refs = context.candidates
             if not refs:
                 reply = (
@@ -423,7 +433,7 @@ class SecretaryService:
                     reply=f"我没有找到可精确对应的未完成任务：{decision.title}",
                 )
         elif decision.kind is CompletionKind.SELECT:
-            pending = self.ledger.pending_completion(message.sender_key, now)
+            pending = self.ledger.pending_completion(message.conversation_key, now)
             if not pending or decision.selection > len(pending):
                 self.ledger.finish(
                     message,
@@ -494,7 +504,26 @@ class SecretaryService:
                 draft, task, message, replace_existing=True, expected_snapshot=snapshot
             ),
         )
+        self._record_reminder_control_context(message, task, now, result)
         return self._finalize(message, [result])
+
+    def _record_reminder_control_context(
+        self, message: MessageEnvelope, task: TaskReference, now: datetime,
+        result: ActionResult,
+    ) -> None:
+        if result.status not in {ExecutionStatus.PLANNED, ExecutionStatus.SUCCEEDED}:
+            return
+        # This records which task was addressed and the latest successful
+        # command's timestamp, not a claim that its reminders remain active.
+        # Activity still comes exclusively from the reminder ledger; completed
+        # task tombstones are also enforced by record_task_context itself.
+        self.ledger.record_task_context(
+            message.conversation_key, (task,),
+            batch_id=f"reminder-control:{message.message_id}",
+            source_message_id=message.message_id, observed_at=now,
+            ttl_seconds=self.settings.completion_context_ttl_seconds,
+            context_kind="reminder-control",
+        )
 
     def _handle_named_reminder(
         self,
@@ -851,6 +880,7 @@ class SecretaryService:
                 return ActionResult("reminder_append", ExecutionStatus.PLANNED if self.settings.dry_run else ExecutionStatus.SUCCEEDED,
                     f"已追加{changed}次｜{task.title}｜首次{dates[0]:%Y-%m-%d %H:%M}，末次{dates[-1]:%Y-%m-%d %H:%M}", destination="微信", external_id=f"reminder:{ids[0]}")
             result = self._run_operation(message, "reminder_append:0", "reminder_append", append, retry_failed=False)
+        self._record_reminder_control_context(message, task, now, result)
         self.ledger.clear_pending_reminder_action(message)
         return self._finalize(message, [result])
 
@@ -1232,7 +1262,8 @@ class SecretaryService:
             classification_kind is IntentKind.TASK
             and not prepared.images and web_page is None and not decision.deep_note
             and len(REMINDER_REQUEST_RE.findall(mask_quoted_text(content))) == 1
-            and not re.search(r"https?://|[；;\n]|另外|同时|并且|还有|分别|截止|最迟|分类|标签|清单|归到", content)
+            and not has_compound_reminder_body(content)
+            and not re.search(r"https?://|另外|同时|并且|还有|分别|截止|最迟|分类|标签|清单|归到", content)
             and not any(name and name in content for name in self.settings.category_map)
         ):
             signals = extract_task_semantics(content, now)

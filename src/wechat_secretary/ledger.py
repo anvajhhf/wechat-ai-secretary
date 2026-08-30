@@ -130,6 +130,10 @@ class IdempotencyLedger:
                     source_message_id TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS private_ingress_protection (
+                    sender_hash TEXT PRIMARY KEY,
+                    token TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS daily_runs (
                     local_date TEXT NOT NULL,
                     job_name TEXT NOT NULL,
@@ -162,6 +166,7 @@ class IdempotencyLedger:
                     project_id TEXT NOT NULL DEFAULT '',
                     task_status TEXT NOT NULL DEFAULT '',
                     source_message_id TEXT NOT NULL,
+                    observed_at TEXT NOT NULL DEFAULT '',
                     expires_at TEXT NOT NULL,
                     PRIMARY KEY (sender_hash, ordinal)
                 );
@@ -226,6 +231,14 @@ class IdempotencyLedger:
             if "task_status" not in operation_columns:
                 self._connection.execute(
                     "ALTER TABLE operations ADD COLUMN task_status TEXT NOT NULL DEFAULT ''"
+                )
+            completion_columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(pending_completion)")
+            }
+            if "observed_at" not in completion_columns:
+                self._connection.execute(
+                    "ALTER TABLE pending_completion ADD COLUMN observed_at TEXT NOT NULL DEFAULT ''"
                 )
 
     @staticmethod
@@ -571,25 +584,33 @@ class IdempotencyLedger:
         with self._lock:
             latest = self._connection.execute(
                 """
-                SELECT batch_id, expires_at FROM task_context
+                SELECT batch_id, observed_at, expires_at FROM task_context
                 WHERE sender_hash = ?
                 ORDER BY observed_at DESC, rowid DESC LIMIT 1
                 """,
                 (sender_hash,),
             ).fetchone()
             if latest is not None:
+                # A delayed inbound command must never operate on a task the
+                # sender had not yet seen. Do not fall back to an older task.
+                if not self._context_observed(latest["observed_at"], now):
+                    return ContextLookup(())
                 if self._pending_expired(latest["expires_at"], now):
                     return ContextLookup((), True)
                 rows = self._connection.execute(
                     """
                     SELECT * FROM task_context
                     WHERE sender_hash = ? AND batch_id = ?
-                      AND task_status != 'completed' AND expires_at >= ?
+                      AND task_status != 'completed'
                     ORDER BY rowid
                     """,
-                    (sender_hash, str(latest["batch_id"]), now.isoformat()),
+                    (sender_hash, str(latest["batch_id"])),
                 ).fetchall()
-                return ContextLookup(tuple(self._row_to_ref(row) for row in rows))
+                return ContextLookup(tuple(
+                    self._row_to_ref(row) for row in rows
+                    if self._context_observed(row["observed_at"], now)
+                    and not self._pending_expired(row["expires_at"], now)
+                ))
             expired = self._connection.execute(
                 """
                 SELECT 1 FROM task_context
@@ -609,12 +630,22 @@ class IdempotencyLedger:
             rows = self._connection.execute(
                 """
                 SELECT * FROM task_context
-                WHERE sender_hash = ? AND task_status != 'completed' AND expires_at >= ?
-                ORDER BY observed_at DESC
+                WHERE sender_hash = ? AND task_status != 'completed'
+                ORDER BY observed_at DESC, rowid DESC
                 """,
-                (sender_hash, now.isoformat()),
+                (sender_hash,),
             ).fetchall()
-        refs = [self._row_to_ref(row) for row in rows]
+        # Resolve each task's latest observation before checking its time.
+        # Otherwise a stale named command could skip the newer control row,
+        # rediscover the original creation row, and undo the newer change.
+        latest_by_task: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            latest_by_task.setdefault(str(row["task_id"]), row)
+        refs = [
+            self._row_to_ref(row) for row in latest_by_task.values()
+            if self._context_observed(row["observed_at"], now)
+            and not self._pending_expired(row["expires_at"], now)
+        ]
         exact = [ref for ref in refs if ref.title.casefold().strip() == wanted]
         candidates = exact or [ref for ref in refs if wanted in ref.title.casefold()]
         unique: dict[str, TaskReference] = {}
@@ -622,38 +653,78 @@ class IdempotencyLedger:
             unique.setdefault(ref.task_id, ref)
         return tuple(unique.values())
 
+    def has_newer_matching_task_context(self, sender_key: str, title: str, now: datetime) -> bool:
+        """Distinguish a rejected stale local target from an unknown task.
+
+        Named completion may search remote tasks when no local task is known,
+        but remote search must not bypass a local chronological rejection.
+        """
+        wanted = title.casefold().strip()
+        if not wanted:
+            return False
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT task_id, title, observed_at FROM task_context
+                   WHERE sender_hash = ? AND task_status != 'completed'
+                   ORDER BY observed_at DESC, rowid DESC""",
+                (self._hash(sender_key),),
+            ).fetchall()
+        latest_by_task: dict[str, sqlite3.Row] = {}
+        for row in rows:
+            latest_by_task.setdefault(str(row["task_id"]), row)
+        exact = [row for row in latest_by_task.values() if str(row["title"]).casefold().strip() == wanted]
+        matches = exact or [row for row in latest_by_task.values() if wanted in str(row["title"]).casefold()]
+        return any(not self._context_observed(row["observed_at"], now) for row in matches)
+
     def set_pending_completion(
         self,
         sender_key: str,
         refs: Iterable[TaskReference],
         source_message_id: str,
         expires_at: datetime,
-    ) -> None:
+        *,
+        observed_at: datetime,
+    ) -> bool:
         sender_hash = self._hash(sender_key)
         with self._lock:
-            self._connection.execute(
-                "DELETE FROM pending_completion WHERE sender_hash = ?", (sender_hash,)
-            )
-            for ordinal, ref in enumerate(refs, start=1):
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                prior = self._connection.execute(
+                    "SELECT observed_at FROM pending_completion WHERE sender_hash = ? LIMIT 1",
+                    (sender_hash,),
+                ).fetchone()
+                if prior and prior["observed_at"] and not self._context_observed(prior["observed_at"], observed_at):
+                    self._connection.execute("COMMIT")
+                    return False
                 self._connection.execute(
-                    """
-                    INSERT INTO pending_completion(
-                        sender_hash, ordinal, task_id, title, category, project_id,
-                        task_status, source_message_id, expires_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        sender_hash,
-                        ordinal,
-                        ref.task_id,
-                        ref.title[:500],
-                        ref.category[:200],
-                        ref.project_id[:300],
-                        ref.status[:50],
-                        source_message_id[:300],
-                        expires_at.isoformat(),
-                    ),
+                    "DELETE FROM pending_completion WHERE sender_hash = ?", (sender_hash,)
                 )
+                for ordinal, ref in enumerate(refs, start=1):
+                    self._connection.execute(
+                        """
+                        INSERT INTO pending_completion(
+                            sender_hash, ordinal, task_id, title, category, project_id,
+                            task_status, source_message_id, observed_at, expires_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sender_hash,
+                            ordinal,
+                            ref.task_id,
+                            ref.title[:500],
+                            ref.category[:200],
+                            ref.project_id[:300],
+                            ref.status[:50],
+                            source_message_id[:300],
+                            observed_at.isoformat(),
+                            expires_at.isoformat(),
+                        ),
+                    )
+                self._connection.execute("COMMIT")
+                return True
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
 
     def pending_completion(
         self, sender_key: str, now: datetime
@@ -663,11 +734,23 @@ class IdempotencyLedger:
             rows = self._connection.execute(
                 """
                 SELECT * FROM pending_completion
-                WHERE sender_hash = ? AND expires_at >= ? ORDER BY ordinal
+                WHERE sender_hash = ? ORDER BY ordinal
                 """,
-                (sender_hash, now.isoformat()),
+                (sender_hash,),
             ).fetchall()
-        return tuple(self._row_to_ref(row) for row in rows)
+        return tuple(
+            self._row_to_ref(row) for row in rows
+            if self._context_observed(row["observed_at"], now)
+            and not self._pending_expired(row["expires_at"], now)
+        )
+
+    @staticmethod
+    def _context_observed(observed_at: object, now: datetime) -> bool:
+        try:
+            observed = datetime.fromisoformat(str(observed_at))
+        except (TypeError, ValueError):
+            return False
+        return observed.tzinfo is not None and now.tzinfo is not None and observed <= now
 
     def clear_pending_completion(self, sender_key: str) -> None:
         with self._lock:
@@ -836,6 +919,36 @@ class IdempotencyLedger:
                     updated_at,
                 ),
             )
+
+    def get_private_protection(self, sender_key: str) -> str:
+        """Return a durable privacy barrier generation, never message content."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT token FROM private_ingress_protection WHERE sender_hash = ?",
+                (self._hash(sender_key),),
+            ).fetchone()
+        return str(row["token"]) if row else ""
+
+    def set_private_protection(self, sender_key: str, token: str) -> None:
+        if not isinstance(token, str) or not token:
+            raise ValueError("privacy protection requires a nonempty generation token")
+        with self._lock:
+            self._connection.execute(
+                """INSERT INTO private_ingress_protection(sender_hash, token) VALUES (?, ?)
+                   ON CONFLICT(sender_hash) DO UPDATE SET token = excluded.token""",
+                (self._hash(sender_key), token),
+            )
+
+    def clear_private_protection(self, sender_key: str, expected_token: str) -> bool:
+        """Clear only the generation actually observed by the recovery request."""
+        if not expected_token:
+            return False
+        with self._lock:
+            removed = self._connection.execute(
+                "DELETE FROM private_ingress_protection WHERE sender_hash = ? AND token = ?",
+                (self._hash(sender_key), expected_token),
+            ).rowcount
+        return removed == 1
 
     def claim_pending_task(
         self,

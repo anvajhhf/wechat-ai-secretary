@@ -36,7 +36,10 @@ REMINDER_REQUEST_RE = re.compile(
 )
 _MEMORY_CUE_RE = re.compile(r"别忘(?:了)?")
 _OUTER_REMINDER_PREFIX = re.compile(
-    rf"^(?:\s|[，,：:]|{_POLITE_PREFIX}|"
+    # ASR punctuation does not change a pure scheduling prefix's intent. Keep
+    # the entire prefix on this whitelist: never skip preceding prose/quotes.
+    # Question marks intentionally remain outside this grammar.
+    rf"^(?:\s|[，,、：:。.;；!！]|{_POLITE_PREFIX}|"
     r"记得|别忘了|不要忘记|务必|一定|"
     r"我想(?:请|让)你|(?:你\s*)?(?:能否|可否|能不能|可不可以|可以|能)|"
     r"在|到|于|的时候|时候|时|都|固定|"
@@ -152,19 +155,23 @@ def _front_loaded_reminder_prefix(text: str, match: re.Match[str]) -> bool:
     """Recognize an action followed by a separately addressed timed reminder.
 
     Do not accept arbitrary prose before a reminder mention: require an action
-    lead, a comma boundary, a schedule-only suffix and no new payload after the
+    lead, a clause boundary, a schedule-only suffix and no new payload after the
     marker. Quotes, reported subjects and status questions remain non-actions.
     """
 
     if not _TRAILING_REMINDER_END.fullmatch(text[match.end():]):
         return False
     prefix = text[:match.start()]
-    boundaries = list(re.finditer(r"[，,]", prefix))
+    boundaries = list(re.finditer(r"[，,。;；!！\n]|(?<!\d)\.|\.(?!\d)", prefix))
     if not boundaries:
         return False
     boundary = boundaries[-1]
     body = prefix[:boundary.start()].strip()
     schedule = prefix[boundary.end():]
+    # Multiple standalone action sentences must not collapse into one task.
+    # This expanded ASR-punctuation tolerance only joins one body to its time.
+    if re.search(r"[。;；!！\n]|(?<!\d)\.|\.(?!\d)", body):
+        return False
     if not _schedule_prefix_matches(schedule) or not any(
         pattern.search(schedule)
         for pattern in (CLOCK_TOKEN_RE, DATE_TOKEN_RE, PERIOD_TOKEN_RE, RELATIVE_TOKEN_RE)

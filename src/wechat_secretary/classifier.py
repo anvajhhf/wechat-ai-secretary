@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime
 from typing import Any, Protocol, Sequence
@@ -191,7 +192,25 @@ class Classifier(Protocol):
 
 
 def _clean_string(value: object, limit: int = 5000) -> str:
-    return str(value or "").strip()[:limit]
+    # Schema-constrained generation is still untrusted data. Objects, arrays
+    # and numbers must not silently turn into note text, titles or metadata.
+    return value.strip()[:limit] if isinstance(value, str) else ""
+
+
+def _string_list(value: object) -> list[str]:
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def _draft_objects(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = payload.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(f"Invalid {key} draft structure")
+    # Never silently truncate a multi-object response and then partially write.
+    if len(value) > 3:
+        raise ValueError(f"Too many {key} drafts; split the request")
+    return value
 
 
 def plan_from_mapping(
@@ -201,6 +220,9 @@ def plan_from_mapping(
     allowed_links: Sequence[str] = (),
     max_links: int = 3,
 ) -> IntentPlan:
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid intent response structure")
+    payload = dict(payload)
     if forced_kind is IntentKind.QUERY:
         # A read-only route cannot acquire write drafts from an invalid response.
         payload = {
@@ -208,6 +230,10 @@ def plan_from_mapping(
             for key, value in payload.items()
             if key in QUERY_ONLY_SCHEMA["properties"]
         }
+    elif forced_kind is IntentKind.TASK:
+        payload.pop("notes", None)
+    elif forced_kind is IntentKind.NOTE:
+        payload.pop("tasks", None)
     raw_kind = _clean_string(payload.get("kind", "clarify"), 20)
     try:
         kind = IntentKind(raw_kind)
@@ -219,11 +245,13 @@ def plan_from_mapping(
     tasks: list[TaskDraft] = []
     notes: list[NoteDraft] = []
 
-    for raw in payload.get("tasks", []) if isinstance(payload.get("tasks"), list) else []:
-        if not isinstance(raw, dict):
-            continue
+    raw_tasks = _draft_objects(payload, "tasks")
+    raw_notes = _draft_objects(payload, "notes")
+    for raw in raw_tasks:
         title = _clean_string(raw.get("title"), 300)
         if not title:
+            if len(raw_tasks) > 1:
+                raise ValueError("Incomplete task drafts; no partial write")
             continue
         priority = _clean_string(raw.get("priority", "none"), 20).lower()
         if priority not in {"none", "low", "medium", "high"}:
@@ -233,7 +261,7 @@ def plan_from_mapping(
         tags = tuple(
             dict.fromkeys(
                 _clean_string(item, 50)
-                for item in raw.get("tags", [])
+                for item in _string_list(raw.get("tags"))
                 if _clean_string(item, 50)
             )
         )[:5]
@@ -286,15 +314,15 @@ def plan_from_mapping(
             )
         )
 
-    for raw in payload.get("notes", []) if isinstance(payload.get("notes"), list) else []:
-        if not isinstance(raw, dict):
-            continue
+    for raw in raw_notes:
         body = _clean_string(raw.get("body"), 20000)
         title = _clean_string(raw.get("title"), 200)
         if not body and not title:
+            if len(raw_notes) > 1:
+                raise ValueError("Incomplete note drafts; no partial write")
             continue
         links: list[str] = []
-        for item in raw.get("links", []):
+        for item in _string_list(raw.get("links")):
             canonical = link_lookup.get(_clean_string(item, 200).casefold())
             if canonical and canonical not in links:
                 links.append(canonical)
@@ -303,7 +331,7 @@ def plan_from_mapping(
         tags = tuple(
             dict.fromkeys(
                 _clean_string(item, 50)
-                for item in raw.get("tags", [])
+                for item in _string_list(raw.get("tags"))
                 if _clean_string(item, 50)
             )
         )[:5]
@@ -329,7 +357,7 @@ def plan_from_mapping(
         kind, notes = IntentKind.TASK, []
     elif forced_kind is IntentKind.NOTE:
         kind, tasks = IntentKind.NOTE, []
-    elif forced_kind is IntentKind.QUERY:
+    elif forced_kind is IntentKind.QUERY or kind is IntentKind.QUERY:
         valid_query = (
             kind is IntentKind.QUERY
             and isinstance(query_raw.get("mode"), str)
@@ -362,7 +390,8 @@ def plan_from_mapping(
         kind = IntentKind.TASK if tasks else IntentKind.NOTE if notes else IntentKind.CLARIFY
 
     try:
-        confidence = max(0.0, min(float(payload.get("confidence", 0.0)), 1.0))
+        confidence = float(payload.get("confidence", 0.0))
+        confidence = max(0.0, min(confidence, 1.0)) if math.isfinite(confidence) else 0.0
     except (TypeError, ValueError):
         confidence = 0.0
 
@@ -654,7 +683,7 @@ class HeuristicClassifier:
                 clarification="请补充文字内容。",
             )
         now = message.received_at.astimezone(self.settings.tz)
-        if forced_kind is None and re.search(r"(有哪些|查询|查一下|列出).{0,8}(任务|待办)", text):
+        if forced_kind in {None, IntentKind.QUERY} and re.search(r"(有哪些|查询|查一下|列出).{0,8}(任务|待办)", text):
             mode = "tomorrow" if "明天" in text else "next7day" if "七天" in text or "一周" in text else "today"
             return IntentPlan(kind=IntentKind.QUERY, query=TaskQuery(mode=mode), confidence=0.92)
 
