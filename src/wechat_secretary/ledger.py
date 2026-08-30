@@ -83,14 +83,35 @@ class IdempotencyLedger:
             timeout=10,
         )
         self._connection.row_factory = sqlite3.Row
-        self._initialize()
+        try:
+            self._initialize()
+        except BaseException:
+            try:
+                self._connection.close()
+            except BaseException:
+                # Preserve the initialization error; never continue with a
+                # partially configured connection or mask its failure reason.
+                pass
+            raise
 
     def _initialize(self) -> None:
         with self._lock:
+            # A ledger shares one locked connection between service/scheduler.
+            # WAL concurrency is unnecessary here and unsafe on some bundled
+            # SQLite versions. Existing WAL databases must be quiesced before
+            # deployment; SQLite must obtain the required lock itself. Never
+            # delete sidecars or continue if the transition is refused.
+            row = self._connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            mode = str(row[0]).casefold() if row else ""
+            expected_mode = "memory" if self._path == ":memory:" else "delete"
+            if mode != expected_mode:
+                raise RuntimeError("本地状态库未进入安全日志模式；请关闭其他连接后重启。")
+            self._connection.execute("PRAGMA synchronous=EXTRA")
+            sync = self._connection.execute("PRAGMA synchronous").fetchone()
+            if not sync or sync[0] != 3:
+                raise RuntimeError("本地状态库未启用要求的持久化保护，已拒绝启动。")
             self._connection.executescript(
                 """
-                PRAGMA journal_mode=WAL;
-                PRAGMA synchronous=FULL;
                 PRAGMA foreign_keys=ON;
                 CREATE TABLE IF NOT EXISTS messages (
                     platform TEXT NOT NULL,

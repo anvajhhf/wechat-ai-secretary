@@ -41,6 +41,7 @@ flowchart LR
 - 滴答服务器仍标记为 `untrusted`。只有配置中逐个列明的只读工具免重复确认；`create_task` 需要本地映射、结构、真实模式和 `-ConfirmRealWrites`，`complete_task` 还要额外通过独立的 `-ConfirmTaskCompletion`。执行器本身会再次检查两个不同的进程授权变量，不依赖 MCP 的临时交互批准。
 - Obsidian 只追加或新建，不覆盖原文；目标路径必须保持在指定 Vault 内。
 - 日志只记录消息引用哈希、结果状态和错误类型，不记录消息正文、Key 或 Token。
+- 秘书状态库固定使用 SQLite `DELETE` 回滚日志模式和 `EXTRA` 同步级别，避免旧运行库的 WAL-reset 风险；不升级或下载依赖。模式无法安全切换时拒绝初始化，不悄悄继续使用 WAL。首次应用该保护必须先停止对应旧网关，让旧连接全部关闭，不能在线删改数据库的 `-wal` / `-shm` 文件。
 
 ## 目录
 
@@ -294,16 +295,16 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 
 DPAPI 备份只能由相应的 Windows 用户环境解密。Vault 位于项目外，仍应使用你单独确认的加密备份方案；本工具不会越界读取或复制。
 
-## 08:00 与 22:00 Cron
+## 08:00 与 22:00 Cron（当前已关闭）
 
-两套档案目前都已创建各自独立的 08:00 今日重点和 22:00 晚间复盘。需要幂等复核或重建时，可从对应档案的本地状态安全读取已验证路由；路由值不会回显：
+两套档案的 08:00 今日重点和 22:00 晚间复盘均已按要求取消，普通升级和重启不会恢复。以下命令仅供用户将来明确要求重新启用时使用，不属于状态检查或日常维护；会从对应档案的本地状态读取已验证路由，路由值不会回显：
 
 ```powershell
 .\scripts\configure-cron.ps1 -Profile owner -UseStoredWeixinRoute -Apply
 .\scripts\configure-cron.ps1 -Profile partner -UseStoredWeixinRoute -Apply
 ```
 
-每套档案只维护自己的两项 Cron，时区固定为 `Asia/Shanghai`；重复运行不会创建同名任务。微信只接收实际提醒正文并保留原有语气，不显示 `Cronjob Response`、Cron 名称、`job_id`、英文管理提示或内部清单名。逐任务到点提醒不依赖这两项 Cron，而使用各自的本地 SQLite 队列。
+重新启用后，每套档案只维护自己的两项 Cron，时区固定为 `Asia/Shanghai`；重复运行不会创建同名任务。微信只接收实际提醒正文并保留原有语气，不显示 `Cronjob Response`、Cron 名称、`job_id`、英文管理提示或内部清单名。逐任务到点提醒不依赖这两项 Cron，而使用各自的本地 SQLite 队列。
 
 ## 故障恢复
 
