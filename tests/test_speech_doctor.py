@@ -26,6 +26,7 @@ from wechat_secretary.speech_onnx import OnnxSpeechTranscriber
 
 TEST_ROOT = Path(__file__).resolve().parents[1] / "runtime" / "test-temp"
 SECRET = "SYNTHETIC-SECRET-DO-NOT-ECHO"
+NOISY_IMPORT_MARKER = "SYNTHETIC-NOISY-IMPORT-MARKER"
 
 
 class SpeechDoctorTests(unittest.TestCase):
@@ -277,19 +278,25 @@ class SpeechDoctorTests(unittest.TestCase):
 
                 def noisy_import(name, *args, **kwargs):
                     if name == "av":
-                        print(SECRET)
-                        print(SECRET, file=sys.stderr)
-                        warnings.warn(SECRET)
-                        logger.warning(SECRET)
+                        # This test checks blanket import-output suppression. A
+                        # non-secret marker avoids teaching static analysis that
+                        # the test itself intentionally logs credential data.
+                        print(NOISY_IMPORT_MARKER)
+                        print(NOISY_IMPORT_MARKER, file=sys.stderr)
+                        warnings.warn(NOISY_IMPORT_MARKER)
+                        logger.warning(NOISY_IMPORT_MARKER)
                         if fail:
-                            raise OSError(SECRET)
+                            raise OSError(NOISY_IMPORT_MARKER)
                     return real_import(name, *args, **kwargs)
 
                 captured_err = io.StringIO()
                 with patch.object(cli.importlib, "import_module", side_effect=noisy_import), redirect_stderr(captured_err):
                     code, output = self.doctor()
                 self.assertEqual(int(fail), code)
-                self.assertNotIn(SECRET, output + captured_err.getvalue() + logged.getvalue())
+                self.assertNotIn(
+                    NOISY_IMPORT_MARKER,
+                    output + captured_err.getvalue() + logged.getvalue(),
+                )
                 self.assertIs(sys.stdout, original_stdout)
                 self.assertIs(sys.stderr, original_stderr)
                 self.assertEqual(original_filters, warnings.filters)
