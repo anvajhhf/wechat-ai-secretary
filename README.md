@@ -1,8 +1,10 @@
 # 微信 AI 个人秘书
 
-这是一个独立、仅在本项目目录内运行的 Windows 版微信个人秘书。Codex 负责搭建、测试和维护代码；正式运行时，明确的提醒和后续补充优先在本地处理，复杂的非私密消息才由 Hermes Agent 调用 DeepSeek API 理解，再按安全规则操作滴答清单和本地 Obsidian。
+这是一个在 Windows 本机运行的微信个人秘书。明确的提醒和后续补充优先由确定性本地规则处理；复杂的非私密消息才由 Hermes Agent 调用 DeepSeek API 理解，再按安全规则操作滴答清单和本地 Obsidian。
 
-配置与历史验收：`owner` 与 `partner` 已分别完成微信扫码和滴答官方 MCP OAuth，共用同一份 DeepSeek API 配置。两人的独立 Vault/私密收件箱路径已配置，Inbox/Obsidian 最小映射已确认；两套档案曾完成专用 Inbox 测试任务的真实创建、完成及回读验收。日常任务、普通笔记、公开链接笔记和自动判断使用 `deepseek-v4-flash`；非私密图片使用 `deepseek-v4-flash-vision-exp`；明确的深度笔记使用 `deepseek-v4-pro`。结构化任务关闭深度思考以降低延迟和 Token。两套中文语音现用本地 Paraformer INT8，SenseVoice INT8 和原 Whisper `small` 缓存保留为手动切换选项，不并行投票或自动回退。两套档案配置为正式写入模式，任务、提醒队列、Cron 和微信发送路由彼此隔离。固定的 08:00 今日重点、22:00 晚间复盘已按要求取消；用户指定的到点提醒不受影响。后台自恢复和当前用户登录自启保留，未安装 Windows 系统服务。历史验收不代表每次新代码都已上线；最新离线审核及部署边界见 [2026-09-01 审核记录](docs/audit-2026-09-01.md)，语音模型更换过程见 [2026-08-31 审核记录](docs/audit-2026-08-31.md)。
+项目内置 `owner` 与 `partner` 两个相互隔离的档案模板。每个部署者都需要自行完成微信、滴答、Vault、允许用户和模型配置；仓库不包含任何真实凭证、账号标识、消息、运行数据库、备份或模型权重。日常任务、普通笔记、公开链接笔记和自动判断默认使用 `deepseek-v4-flash`，非私密图片使用 `deepseek-v4-flash-vision-exp`，明确的深度笔记使用 `deepseek-v4-pro`；结构化任务关闭深度思考以降低延迟和 Token。中文语音推荐本地 Paraformer INT8，也可手动选择 SenseVoice INT8 或 Whisper `small`，不会并行投票或自动回退。历史离线验收和部署边界见 [审核记录](docs/)，但它们不是任意环境下的可用性保证。
+
+> 本项目是非官方社区项目，与微信/Weixin、滴答清单、DeepSeek、Obsidian 或 Nous Research 均无隶属或背书关系。使用外部服务前请自行确认其当前条款、API 权限和数据政策。
 
 ## 设计概览
 
@@ -61,8 +63,8 @@ wechat-ai-secretary/
 
 | 档案 | Hermes/OAuth | 状态库 | Vault | 私密收件箱 |
 |---|---|---|---|---|
-| `owner` | `runtime/hermes-home` | `runtime/state/owner` | `D:\WeChatAIData\owner\Vault` | `D:\WeChatAIData\owner\PrivateInbox` |
-| `partner` | `runtime/hermes-home-partner` | `runtime/state/partner` | `D:\WeChatAIData\partner\Vault` | `D:\WeChatAIData\partner\PrivateInbox` |
+| `owner` | `runtime/hermes-home` | `runtime/state/owner` | `<data-root>\owner\Vault` | `<data-root>\owner\PrivateInbox` |
+| `partner` | `runtime/hermes-home-partner` | `runtime/state/partner` | `<data-root>\partner\Vault` | `<data-root>\partner\PrivateInbox` |
 
 这些数据目录与程序目录分离不会影响运行。它们只是明确的读写目标；程序升级或重装项目依赖时不会把笔记混进代码目录。两套目录仍属于同一个 Windows 账号的文件权限范围，如需防止彼此在电脑上手动查看，还要另外使用不同 Windows 账号或文件权限。
 
@@ -125,7 +127,7 @@ wechat-ai-secretary/
 此外安装脚本会应用 `hermes-weixin-secretary-ingress.patch`：仅本项目入口启用时，串行处理同一发送者的媒体下载，禁用文字自动合批与内容指纹去重；普通 Hermes 启动不受影响。项目入口会核验补丁标记，缺补丁时拒绝启动，避免悄悄使用旧消息链路。已有 Whisper 缓存无需重下；选择新的 ONNX 后端时，需显式执行一次下方的模型准备步骤。
 
 ```powershell
-Set-Location D:\Codex\workspaces\my-tools\wechat-ai-secretary
+# 在仓库根目录运行
 .\scripts\install-local.ps1
 ```
 
@@ -167,7 +169,7 @@ ONNX 后端使用16kHz单声道真实重采样、CPU 1—4线程和本地 Silero
 所有 Key、Token 和扫码都由你在本机终端完成。`-Profile` 决定写入哪一套独立凭证目录。不要在同一次向导中混用两个人的账号。
 
 ```powershell
-# 两套均已完成；以下命令仅用于将来重配
+# 每个档案都需要在本机独立配置
 .\scripts\setup-auth.ps1 -Profile owner -ConfigureModel
 .\scripts\setup-auth.ps1 -Profile owner -ConfigureWeixin
 
@@ -195,7 +197,7 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 .\scripts\inspect-dida.ps1 -Profile partner
 ```
 
-当前只读结果：`owner` 有 `Inbox` 和滴答自带的 `👋欢迎`，`partner` 只有 `Inbox`；两者均没有清单文件夹或标签。`👋欢迎` 只是新账号引导清单，不参与业务映射。
+结果取决于当前授权的滴答账号。建议先复用账号内已有的业务清单；新账号自带的欢迎清单不应自动参与业务映射。
 
 官方 MCP 已公布可解析的工具结构，可随时用下列命令重新核对；它只做工具发现，不调用任何任务工具：
 
@@ -203,16 +205,16 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 .\scripts\inspect-dida-schema.ps1 -Profile owner
 ```
 
-2026-08-25 已用 owner 档案实时执行只读工具发现，并由本地结构校验器确认：`create_task` 使用外层 `task` 对象，日期使用 `dueDate`、`timeZone`、`isAllDay`，优先级为 `0/1/3/5`；`complete_task` 必须同时提供 `project_id` 与 `task_id`，`get_task_by_id` 只需要 `task_id`，`search_task` 使用 `query`。该命令现在会拒绝空结构或缺少必填字段的定义。
+固定的本地结构校验器会核对：`create_task` 使用外层 `task` 对象，日期使用 `dueDate`、`timeZone`、`isAllDay`，优先级为 `0/1/3/5`；`complete_task` 必须同时提供 `project_id` 与 `task_id`，`get_task_by_id` 只需要 `task_id`，`search_task` 使用 `query`。工具发现为空或缺少必填字段时会拒绝继续。
 
-当前已确认两套档案都使用现有 Inbox，不映射 `👋欢迎`，也不创建分类或标签；两个本地配置的 `dida.mapping_confirmed` 已设为 `true`，`category_map` / `tag_map` 保持为空。owner 与 partner 均已分别用同一条专用任务依次完成真实创建、完成及精确回读，两套配置的 `schema_confirmed` 和 `complete_schema_confirmed` 均已设为 `true`。创建与完成后的回读都要求任务 ID、标题和清单精确对应；Hermes 同时返回文字与结构化结果时只使用结构化内容做机器核验；远端写入失败不会自动重试。
+每个部署者必须在自己的账号上确认清单映射及工具结构后，才可在本地配置中启用 `mapping_confirmed`、`schema_confirmed` 和 `complete_schema_confirmed`。真实写入验收应使用可删除的专用测试任务，并核对任务 ID、标题和清单；远端写入失败不会自动重试。
 
 ### Obsidian
 
-两个空 Vault 已按推荐路径创建。先在 Obsidian 的 Vault 管理界面分别选择“打开文件夹作为仓库”：
+先在 Obsidian 的 Vault 管理界面分别选择“打开文件夹作为仓库”，例如：
 
-- `D:\WeChatAIData\owner\Vault`
-- `D:\WeChatAIData\partner\Vault`
+- `<data-root>\owner\Vault`
+- `<data-root>\partner\Vault`
 
 `PrivateInbox` 不要作为 Vault 打开。程序只检查配置中指定的目录，不扫描磁盘。只读检查命令：
 
@@ -221,7 +223,7 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 .\scripts\inspect-vault.ps1 -Profile partner
 ```
 
-目前两个 Vault 为空，最小映射已确认：都使用 `Inbox/微信收件箱.md`，不预创建大量目录或空白双链；两个本地配置的 `obsidian.mapping_confirmed` 已设为 `true`。后续已有真实目录和笔记时再扩充 `folder_map`、`known_links`。
+推荐从 `Inbox/微信收件箱.md` 的最小映射开始，不预创建大量目录或空白双链。只在确认目标 Vault 后设置 `obsidian.mapping_confirmed = true`；后续已有真实目录和笔记时再扩充 `folder_map`、`known_links`。
 
 ## 启动、停止与状态
 
@@ -255,7 +257,7 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 .\scripts\start.ps1 -Profile partner -ConfirmWechatReplies -ConfirmRealWrites -ConfirmTaskCompletion
 ```
 
-本地逐任务提醒按档案独立授权，还需要该档案的 `reminders.enabled = true` 和第三个显式参数。当前两套档案都已分别授权：
+本地逐任务提醒按档案独立授权，还需要该档案的 `reminders.enabled = true` 和第三个显式参数：
 
 ```powershell
 .\scripts\start.ps1 -Profile owner -ConfirmWechatReplies -ConfirmRealWrites -ConfirmReminders
@@ -274,7 +276,7 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 .\scripts\stop.ps1 -Profile partner -ConfirmStop
 ```
 
-当前后台常驻通过当前 Windows 用户的计划任务实现，不安装系统服务。主入口和每分钟健康检查都经 `wscript.exe` 无控制台窗口启动，PowerShell 与网关不会弹出黑框。两套档案已分别启用；可随时核对状态：
+可选的后台常驻通过当前 Windows 用户的计划任务实现，不安装系统服务。主入口和每分钟健康检查都经 `wscript.exe` 无控制台窗口启动，PowerShell 与网关不会弹出黑框。启用后可随时核对状态：
 
 ```powershell
 .\scripts\status-autostart.ps1 -Profile owner
@@ -311,9 +313,9 @@ OAuth 完成后，分别运行只读检查。它只开放 `secretary_dida_taxono
 
 DPAPI 备份只能由相应的 Windows 用户环境解密。Vault 位于项目外，仍应使用你单独确认的加密备份方案；本工具不会越界读取或复制。
 
-## 08:00 与 22:00 Cron（当前已关闭）
+## 可选的 08:00 与 22:00 汇总 Cron
 
-两套档案的 08:00 今日重点和 22:00 晚间复盘均已按要求取消，普通升级和重启不会恢复。以下命令仅供用户将来明确要求重新启用时使用，不属于状态检查或日常维护；会从对应档案的本地状态读取已验证路由，路由值不会回显：
+这两项固定汇总默认不启用，普通升级和重启不会自行创建。只有用户明确需要时才运行以下命令；它会从对应档案的本地状态读取已验证路由，路由值不会回显：
 
 ```powershell
 .\scripts\configure-cron.ps1 -Profile owner -UseStoredWeixinRoute -Apply
@@ -334,16 +336,20 @@ DPAPI 备份只能由相应的 Windows 用户环境解密。Vault 位于项目�
 
 ## 当前限制
 
-- 历史版本曾完成图片、语音、私密链路、真实滴答写入、Obsidian 写入、任务完成和两端独立提醒验收；不代表本轮新代码已部署或重新完成真实写入验收。
+- 审核记录包含特定历史版本的离线及部署验收；不代表当前提交已在其他机器部署，也不能代替部署者自己的 Dry Run 和授权核验。
 - GIF 只分析第一帧；视觉结果不能保证精确识别极小文字，关键日期、金额或任务对象不明确时会要求确认。新语音模型本次原声回放已正确区分“明天/每天”，但仍有“试剂盒”或 `B2M` 等术语听错，不能从转写自动发现所有错误。保留澄清与短句纠正，不将单个原声或合成语音通过当成真实使用准确率保证，也不强制猜写术语。
 - “私密：”如果只在语音里说出，系统必须先做本地 ASR 才能知道该前缀，因此会拒绝继续处理；要保证连本地 ASR 都不运行，请在发送媒体前先发“私密：下一条”。
 - 链接笔记只支持公开 HTML、XHTML 和纯文本页面；登录页、付费墙、需要 Cookie 的页面、PDF、文件下载及大多数强依赖 JavaScript 的页面会明确拒绝或提示改发截图。
 - 实际创建和完成仍保留结构验证、精确回读、幂等及失败不冒充成功等安全闸门。
-- Windows 无窗口后台常驻、每分钟真实健康检查和当前用户登录自启已通过两套独立计划任务启用；未安装 Windows 系统服务，未登录该用户前不会运行。计划内维护重启会静默省略无实际任务被中断时的 Gateway 停机广播；若确有正在处理的消息，仍保留必要的中断提示。
+- Windows 无窗口后台常驻、每分钟健康检查和当前用户登录自启是可选功能；未安装 Windows 系统服务，未登录该用户前不会运行。计划内维护重启会静默省略无实际任务被中断时的 Gateway 停机广播；若确有正在处理的消息，仍保留必要的中断提示。
 
 ## 自动检查
 
-GitHub 私有仓库每次推送或发起拉取请求时，使用 Windows runner 安装锁定的 Hermes 版本，执行仓库凭证扫描、全部 PowerShell 语法检查、Python 编译、全部离线测试以及仅使用合成数据的 DPAPI 备份自检。单元测试不会下载模型或读取真实语音。工作流权限仅为读取仓库内容，不持久化检出凭证，也不使用项目 API Key。
+GitHub Actions 每次推送或发起拉取请求时，使用 Windows runner 安装锁定的 Hermes 版本，执行当前文件与完整可达历史的凭证扫描、全部 PowerShell 语法检查、Python 编译、全部离线测试以及仅使用合成数据的 DPAPI 备份自检。单元测试不会下载模型或读取真实语音。工作流依赖锁定到不可变提交，权限按最小范围设置，不持久化检出凭证，也不使用项目 API Key。公开仓库还会运行 CodeQL；依赖更新由 Dependabot 定期检查。
+
+## 开源许可与安全
+
+项目代码使用 [MIT License](LICENSE)。上游 Hermes Agent、Python 依赖和另行下载的语音模型不因此变为项目自有资产，具体归属及许可边界见 [第三方声明](THIRD_PARTY_NOTICES.md)。发现安全问题请按 [安全策略](SECURITY.md) 私下报告；请勿在公开 Issue 中粘贴凭证、私聊、原始语音、Vault 内容或生产数据库。
 
 ## 官方资料
 

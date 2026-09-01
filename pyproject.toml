@@ -7,7 +7,16 @@ name = "wechat-ai-secretary"
 version = "0.1.0"
 description = "本机运行的 Hermes + DeepSeek 微信个人秘书"
 readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "anvajhhf"}]
 requires-python = ">=3.11,<3.14"
+keywords = ["wechat", "assistant", "hermes-agent", "deepseek", "reminder"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
 dependencies = [
   "Pillow>=11.3,<13",
   "tzdata>=2025.3; sys_platform == 'win32'",
@@ -23,6 +32,10 @@ media = [
 
 [project.scripts]
 wechat-secretary = "wechat_secretary.cli:main"
+
+[project.urls]
+Repository = "https://github.com/anvajhhf/wechat-ai-secretary"
+Issues = "https://github.com/anvajhhf/wechat-ai-secretary/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
