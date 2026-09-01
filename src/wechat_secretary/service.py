@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -70,6 +71,7 @@ from .web_reader import (
 
 
 _FAILED_OPERATION_REPLAY = "此前写操作失败；为避免重复，本次没有自动重试"
+_LOCAL_REMINDER_PROJECT_ID = "__wechat_secretary_local_reminder__"
 
 
 class SecretaryService:
@@ -362,6 +364,35 @@ class SecretaryService:
     def _complete_reference(
         self, message: MessageEnvelope, task: TaskReference
     ) -> HandlingResult:
+        if task.project_id == _LOCAL_REMINDER_PROJECT_ID:
+            status = (
+                ExecutionStatus.PLANNED
+                if self.settings.dry_run
+                else ExecutionStatus.SUCCEEDED
+            )
+            result = self._run_operation(
+                message,
+                "task_complete:0",
+                "complete",
+                lambda: ActionResult(
+                    action="complete",
+                    status=status,
+                    summary=task.title,
+                    destination="本地提醒",
+                    external_id=task.task_id,
+                    task_refs=(task,),
+                ),
+                retry_failed=False,
+            )
+            if result.status in {ExecutionStatus.PLANNED, ExecutionStatus.SUCCEEDED}:
+                self.ledger.mark_task_completed(
+                    message.sender_key,
+                    task.task_id,
+                    conversation_key=message.conversation_key,
+                )
+                self.ledger.clear_pending_completion(message.conversation_key)
+            return self._finalize(message, [result])
+
         result = self._run_operation(
             message,
             "task_complete:0",
@@ -385,7 +416,7 @@ class SecretaryService:
             self.ledger.finish(message, ExecutionStatus.SKIPPED)
             return HandlingResult(
                 status=ExecutionStatus.SKIPPED,
-                reply="收到，不会更改滴答任务状态。",
+                reply="收到，不会更改任务或提醒状态。",
                 llm_called=False,
             )
         if decision.kind is CompletionKind.BATCH_REFUSED:
@@ -637,6 +668,30 @@ class SecretaryService:
         results: list[ActionResult] = []
         task_context: list[TaskReference] = []
         for index, task in enumerate(plan.tasks):
+            local_reference = self._local_reminder_reference(message, task, index)
+            local_only = bool(
+                task.local_only_reminder
+                and self.settings.local_only_explicit_reminders
+                and task.reminder_at
+            )
+            if local_only:
+                reminder_result = self._run_operation(
+                    message,
+                    f"reminder_create:{index}",
+                    "reminder",
+                    lambda task=task, ref=local_reference: self.reminders.schedule(
+                        task, ref, message
+                    ),
+                )
+                results.append(reminder_result)
+                if reminder_result.status in {
+                    ExecutionStatus.PLANNED,
+                    ExecutionStatus.SUCCEEDED,
+                    ExecutionStatus.SKIPPED,
+                }:
+                    task_context.append(local_reference)
+                continue
+
             task_result = self._run_operation(
                 message,
                 f"task_create:{index}",
@@ -665,6 +720,28 @@ class SecretaryService:
                             task, ref, message
                         ),
                     )
+                elif (
+                    self.settings.local_only_explicit_reminders
+                    or self.settings.default_task_reminders
+                ):
+                    # A local notification is an independent user promise. A
+                    # temporary Dida outage must not discard a fully grounded
+                    # reminder; use a stable local reference and report the
+                    # Dida failure separately.
+                    reminder_result = self._run_operation(
+                        message,
+                        f"reminder_create:{index}",
+                        "reminder",
+                        lambda task=task, ref=local_reference: self.reminders.schedule(
+                            task, ref, message
+                        ),
+                    )
+                    if reminder_result.status in {
+                        ExecutionStatus.PLANNED,
+                        ExecutionStatus.SUCCEEDED,
+                        ExecutionStatus.SKIPPED,
+                    }:
+                        task_context.append(local_reference)
                 else:
                     dependency_status = (
                         ExecutionStatus.UNCERTAIN
@@ -747,6 +824,34 @@ class SecretaryService:
                 llm_called=llm_called,
             )
         return self._finalize(message, results, llm_called=llm_called)
+
+    @staticmethod
+    def _local_reminder_reference(
+        message: MessageEnvelope,
+        task: TaskDraft,
+        index: int,
+    ) -> TaskReference:
+        material = "\0".join(
+            (
+                message.platform,
+                message.account_id,
+                message.user_id,
+                message.chat_id,
+                message.message_id,
+                str(index),
+                task.title,
+            )
+        )
+        task_id = "local-reminder-" + hashlib.sha256(
+            material.encode("utf-8")
+        ).hexdigest()[:24]
+        return TaskReference(
+            task_id=task_id,
+            title=task.title,
+            category="本地提醒",
+            project_id=_LOCAL_REMINDER_PROJECT_ID,
+            status="open",
+        )
 
     def _action_reply(self, message: MessageEnvelope, reply: str) -> HandlingResult:
         self.ledger.finish(message, ExecutionStatus.SKIPPED)
@@ -1313,6 +1418,10 @@ class SecretaryService:
                     content, IntentPlan(kind=IntentKind.TASK, confidence=1.0), now,
                     expected_kind=classification_kind,
                     allow_daily=not bool(prepared.transcript_text),
+                    default_task_reminders=self.settings.default_task_reminders,
+                    default_day_reminder_time=self.settings.default_day_reminder_time,
+                    default_week_reminder_weekday=self.settings.default_week_reminder_weekday,
+                    default_week_reminder_time=self.settings.default_week_reminder_time,
                 )
         links = (
             self.obsidian.available_links(model_content)
@@ -1363,6 +1472,10 @@ class SecretaryService:
             allow_enriched_note=bool(web_page is not None or prepared.images),
             allow_explicit_task_fallback=decision.forced_kind is IntentKind.TASK,
             allow_daily=not bool(prepared.transcript_text),
+            default_task_reminders=self.settings.default_task_reminders,
+            default_day_reminder_time=self.settings.default_day_reminder_time,
+            default_week_reminder_weekday=self.settings.default_week_reminder_weekday,
+            default_week_reminder_time=self.settings.default_week_reminder_time,
         )
         plan = guard.plan
         if not guard.ready or plan.kind is IntentKind.CLARIFY or plan.confidence < 0.55:

@@ -35,7 +35,10 @@ from wechat_secretary.routing import (
     is_non_action_task_utterance,
     normalize_routing_text,
 )
-from wechat_secretary.semantic_guard import looks_like_pending_followup
+from wechat_secretary.semantic_guard import (
+    looks_like_pending_followup,
+    validate_plan_semantics,
+)
 from wechat_secretary.service import SecretaryService
 
 
@@ -1156,6 +1159,140 @@ class RecurringReminderTests(unittest.TestCase):
         self.assertEqual(3, ledger.active_reminder_count("task-1", source))
         self.assertIsNone(
             ledger.reminder_status("task-1", NOW + timedelta(minutes=31))
+        )
+
+
+class ReminderBackendPolicyTests(unittest.TestCase):
+    def test_dated_tasks_get_visible_defaults_but_timeless_tasks_do_not(self) -> None:
+        weekly = validate_plan_semantics(
+            "这周把医保报销办了",
+            IntentPlan(
+                kind=IntentKind.TASK,
+                tasks=(TaskDraft("医保报销"),),
+            ),
+            NOW,
+            expected_kind=IntentKind.TASK,
+            default_task_reminders=True,
+            default_week_reminder_weekday=5,
+            default_week_reminder_time="16:00",
+        )
+        timeless = validate_plan_semantics(
+            "记着买血压计",
+            IntentPlan(
+                kind=IntentKind.TASK,
+                tasks=(TaskDraft("买血压计"),),
+            ),
+            NOW,
+            expected_kind=IntentKind.TASK,
+            default_task_reminders=True,
+        )
+
+        self.assertTrue(weekly.ready)
+        self.assertEqual("2026-08-30", weekly.plan.tasks[0].due_date)
+        self.assertEqual(
+            "2026-08-28T16:00+08:00",
+            weekly.plan.tasks[0].reminder_at,
+        )
+        self.assertFalse(weekly.plan.tasks[0].local_only_reminder)
+        self.assertTrue(timeless.ready)
+        self.assertEqual("买血压计", timeless.plan.tasks[0].title)
+        self.assertEqual("", timeless.plan.tasks[0].due_date)
+        self.assertEqual("", timeless.plan.tasks[0].reminder_at)
+
+    def test_natural_week_and_remember_phrases_route_as_tasks(self) -> None:
+        for text in ("这周把医保报销办了", "记着买血压计"):
+            with self.subTest(text=text):
+                self.assertIs(detect_route_hint(text).kind, IntentKind.TASK)
+
+    def test_explicit_reminder_without_schedule_still_asks_only_for_time(self) -> None:
+        decision = validate_plan_semantics(
+            "提醒我买血压计",
+            IntentPlan(kind=IntentKind.TASK, tasks=(TaskDraft("买血压计"),)),
+            NOW,
+            expected_kind=IntentKind.TASK,
+            default_task_reminders=True,
+        )
+
+        self.assertFalse(decision.ready)
+        self.assertIs(
+            decision.reason,
+            ClarificationReason.MISSING_REMINDER_DATE_TIME,
+        )
+        self.assertIn("日期和具体时间", decision.question)
+
+    def test_explicit_reminder_can_run_without_any_dida_write(self) -> None:
+        cfg = make_settings(
+            dry_run=False,
+            reminders_enabled=True,
+            local_only_explicit_reminders=True,
+            default_task_reminders=True,
+        )
+        classifier = StaticClassifier(IntentPlan(kind=IntentKind.CLARIFY))
+        service, dida, ledger = make_service(classifier, cfg=cfg)
+        self.addCleanup(ledger.close)
+        incoming = make_message(
+            "local-only-reminder",
+            "明天下午3点提醒我回电话",
+        )
+
+        result = service.handle(incoming)
+
+        self.assertEqual(0, classifier.call_count)
+        self.assertEqual(0, len(dida.create_calls))
+        self.assertEqual(("reminder",), tuple(item.action for item in result.results))
+        reference = result.results[0].task_refs[0]
+        self.assertTrue(reference.task_id.startswith("local-reminder-"))
+        self.assertEqual(
+            1,
+            ledger.active_reminder_count(reference.task_id, incoming),
+        )
+
+        completed = service.handle(
+            make_message(
+                "complete-local-reminder",
+                "搞定了",
+                NOW + timedelta(minutes=1),
+            )
+        )
+        self.assertEqual(ExecutionStatus.SUCCEEDED, completed.status)
+        self.assertEqual(
+            0,
+            ledger.active_reminder_count(reference.task_id, incoming),
+        )
+
+    def test_dated_task_reminder_survives_a_dida_connection_failure(self) -> None:
+        cfg = make_settings(
+            dry_run=False,
+            reminders_enabled=True,
+            local_only_explicit_reminders=True,
+            default_task_reminders=True,
+        )
+        classifier = StaticClassifier(
+            IntentPlan(
+                kind=IntentKind.TASK,
+                tasks=(TaskDraft("提交报告"),),
+            )
+        )
+        dida = RecordingDida(ExecutionStatus.FAILED)
+        service, _, ledger = make_service(classifier, dida=dida, cfg=cfg)
+        self.addCleanup(ledger.close)
+        incoming = make_message("dida-failed-local-survives", "明天提交报告")
+
+        result = service.handle(incoming)
+
+        self.assertEqual(1, len(dida.create_calls))
+        self.assertEqual("2026-08-25", dida.create_calls[0].due_date)
+        self.assertEqual(
+            "2026-08-25T09:00+08:00",
+            dida.create_calls[0].reminder_at,
+        )
+        self.assertEqual(("task", "reminder"), tuple(item.action for item in result.results))
+        self.assertIs(result.results[0].status, ExecutionStatus.FAILED)
+        self.assertIs(result.results[1].status, ExecutionStatus.SUCCEEDED)
+        local_reference = result.results[1].task_refs[0]
+        self.assertEqual(
+            1,
+            ledger.active_reminder_count(local_reference.task_id, incoming),
         )
 
 

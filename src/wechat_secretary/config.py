@@ -52,6 +52,13 @@ def _as_bool(value: object, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _wall_clock(value: object, default: str) -> str:
+    clock = str(value if value is not None else default).strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", clock):
+        raise ValueError("默认提醒时间必须使用 HH:MM 24 小时格式")
+    return clock
+
+
 def _as_path(value: object, project_root: Path) -> Path | None:
     raw = str(value or "").strip()
     if not raw:
@@ -91,6 +98,11 @@ class SecretarySettings:
     reminder_poll_seconds: int = 15
     reminder_overdue_merge_seconds: int = 7200
     reminder_retry_seconds: int = 60
+    local_only_explicit_reminders: bool = False
+    default_task_reminders: bool = False
+    default_day_reminder_time: str = "09:00"
+    default_week_reminder_weekday: int = 5
+    default_week_reminder_time: str = "16:00"
     vault_path: Path | None = None
     private_inbox_path: Path | None = None
     default_note_path: str = "Inbox/微信收件箱.md"
@@ -288,6 +300,21 @@ class SecretarySettings:
             ),
             reminder_retry_seconds=max(
                 30, min(int(reminders.get("retry_seconds", 60)), 3600)
+            ),
+            local_only_explicit_reminders=_as_bool(
+                reminders.get("local_only_explicit"), False
+            ),
+            default_task_reminders=_as_bool(
+                reminders.get("default_for_dated_tasks"), False
+            ),
+            default_day_reminder_time=_wall_clock(
+                reminders.get("default_day_time"), "09:00"
+            ),
+            default_week_reminder_weekday=max(
+                1, min(int(reminders.get("default_week_weekday", 5)), 7)
+            ),
+            default_week_reminder_time=_wall_clock(
+                reminders.get("default_week_time"), "16:00"
             ),
             vault_path=_as_path(obsidian.get("vault_path", ""), root),
             private_inbox_path=_as_path(obsidian.get("private_inbox_path", ""), root),

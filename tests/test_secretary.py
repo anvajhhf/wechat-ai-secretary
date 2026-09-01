@@ -1272,10 +1272,12 @@ class GatewayProfileIsolationTests(unittest.TestCase):
     def test_gateway_entry_anchors_plugin_discovery_at_project_root(self) -> None:
         home = test_directory("gateway-entry-project-root")
         observed: list[Path] = []
+        oauth_modes: list[str] = []
         fake_main = ModuleType("hermes_cli.main")
 
         def run_gateway() -> int:
             observed.append(Path.cwd().resolve())
+            oauth_modes.append(os.environ.get("HERMES_MCP_OAUTH_INTERACTIVE", ""))
             return 0
 
         fake_main.main = run_gateway  # type: ignore[attr-defined]
@@ -1305,6 +1307,7 @@ class GatewayProfileIsolationTests(unittest.TestCase):
             os.chdir(original_cwd)
 
         self.assertEqual([ROOT.resolve()], observed)
+        self.assertEqual(["0"], oauth_modes)
 
     def test_exact_stopper_rejects_state_from_another_home(self) -> None:
         root = test_directory("gateway-stop-marker")

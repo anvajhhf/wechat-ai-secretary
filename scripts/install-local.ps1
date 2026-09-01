@@ -11,6 +11,7 @@ $runtime = Join-Path $root "runtime"
 $hermesSource = Join-Path $runtime "hermes-agent"
 $hermesCompatibilityPatches = @(
     (Join-Path $root "patches\hermes-dida-oauth-issuer.patch"),
+    (Join-Path $root "patches\hermes-gateway-no-interactive-oauth.patch"),
     (Join-Path $root "patches\hermes-exact-tool-approval.patch"),
     (Join-Path $root "patches\hermes-weixin-compact-multiline.patch"),
     (Join-Path $root "patches\hermes-gateway-ready-hook.patch"),

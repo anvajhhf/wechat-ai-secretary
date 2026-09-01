@@ -61,6 +61,11 @@ def main() -> int:
         return 2
     os.environ["WECHAT_SECRETARY_STRICT_INGRESS"] = "1"
 
+    # A gateway is unattended. If an OAuth token is rejected or refresh fails,
+    # the MCP connection must park and wait for an explicit maintenance login;
+    # it must never open consent tabs in the user's browser on its own.
+    os.environ["HERMES_MCP_OAUTH_INTERACTIVE"] = "0"
+
     # Keep the marker in the operating-system command line so Hermes' process
     # scanner can distinguish the two custom homes, but hide it from its parser.
     del sys.argv[1:3]

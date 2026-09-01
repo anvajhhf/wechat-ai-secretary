@@ -171,6 +171,32 @@ class RuntimeCompatibilityTests(unittest.TestCase):
         self.assertIn("hermes-weixin-secretary-ingress.patch", installer)
         self.assertTrue((ROOT / "patches" / "hermes-weixin-secretary-ingress.patch").is_file())
 
+    def test_gateway_oauth_patch_is_installed_and_process_wide(self) -> None:
+        from tools.mcp_oauth import (
+            OAuthNonInteractiveError,
+            _is_interactive,
+            _make_redirect_handler,
+            force_interactive_oauth,
+        )
+
+        installer = (ROOT / "scripts" / "install-local.ps1").read_text(
+            encoding="utf-8-sig"
+        )
+        patch_path = ROOT / "patches" / "hermes-gateway-no-interactive-oauth.patch"
+        self.assertIn(patch_path.name, installer)
+        self.assertTrue(patch_path.is_file())
+        with patch.dict(
+            os.environ,
+            {"HERMES_MCP_OAUTH_INTERACTIVE": "0"},
+            clear=False,
+        ), force_interactive_oauth():
+            self.assertFalse(_is_interactive())
+            redirect = _make_redirect_handler(49152)
+            with patch("tools.mcp_oauth.webbrowser.open") as browser_open:
+                with self.assertRaises(OAuthNonInteractiveError):
+                    asyncio.run(redirect("https://example.invalid/authorize"))
+                browser_open.assert_not_called()
+
 
 class GatewayOrderingTests(unittest.TestCase):
     def test_one_worker_per_conversation_preserves_submission_order(self) -> None:

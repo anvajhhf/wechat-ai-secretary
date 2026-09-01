@@ -93,6 +93,10 @@ class TaskDraft:
     description: str = ""
     reminder_at: str = ""
     reminder_recurrence: ReminderRecurrence | None = None
+    # Set only by the local semantic guard. The model schema cannot request
+    # this mode. When the profile opts in, an explicit reminder is stored in
+    # the local queue without creating a duplicate Dida task.
+    local_only_reminder: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

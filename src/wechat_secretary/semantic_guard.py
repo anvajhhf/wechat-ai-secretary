@@ -61,7 +61,14 @@ _STRONG_MULTI_TASK_SEPARATOR_RE = re.compile(
 _TASK_REQUEST_PREFIX_RE = re.compile(
     r"^\s*(?:(?:请|麻烦|劳驾|帮我|你能|能否|可否|能不能|可不可以|可以)\s*)?"
     r"(?:(?:创建|新建)\s*(?:一个|一条|个|条)?\s*(?:任务|待办)\s*|"
-    r"(?:记得|别忘了|安排(?:一下)?)\s*)"
+    r"(?:记得|记着|记住|别忘了|安排(?:一下)?)\s*)"
+)
+
+_TASK_WEEK_WINDOW_LEAD_RE = re.compile(
+    r"^\s*(?:(?:请|麻烦|劳驾|帮我)\s*)?"
+    r"(?P<window>本周|这周|这个星期|这星期|本星期|下周|下个星期|下星期|下礼拜)"
+    r"(?=\s*(?:内|之内|以内|把|将|要|得|需要|去|买|购买|办|办理|完成|提交|联系|"
+    r"发送|准备|整理|预约|缴费|续费|回复|复查|看医生|吃药))"
 )
 _TASK_DATE_CONTROL_RE = re.compile(
     rf"(?:{_COMPLEX_WEEKLY_RE.pattern}|"
@@ -110,6 +117,7 @@ class TaskSemanticSignals:
     clock_conflict: bool = False
     reminder_period: str = ""
     complex_recurrence: bool = False
+    task_week_window: str = ""
 
 
 @dataclass(frozen=True)
@@ -413,6 +421,77 @@ def _reminder_iso(at: datetime) -> str:
     return at.isoformat(timespec=precision)
 
 
+def _task_week_window(text: str) -> str:
+    """Return a locally grounded whole-week task window, if one leads the request."""
+
+    match = _TASK_WEEK_WINDOW_LEAD_RE.search(mask_quoted_text(text))
+    if match is None:
+        return ""
+    return "next" if match.group("window").startswith("下") else "current"
+
+
+def _combine_local(day: str, clock: str, now: datetime) -> datetime:
+    return datetime.fromisoformat(f"{day}T{clock}:00").replace(tzinfo=now.tzinfo)
+
+
+def _next_whole_hour(now: datetime) -> datetime:
+    candidate = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    if candidate <= now:
+        candidate += timedelta(hours=1)
+    return candidate
+
+
+def _default_task_schedule(
+    signals: TaskSemanticSignals,
+    now: datetime,
+    *,
+    day_clock: str,
+    week_weekday: int,
+    week_clock: str,
+) -> tuple[str, str, str]:
+    """Build a visible, future one-shot default for a dated natural task.
+
+    The return value is ``(due_date, due_time, reminder_at)``. A whole-week
+    request is due on Sunday and normally nudged on the configured weekday.
+    If that preferred point has already passed, use the next reasonable
+    daytime slot inside the same window; never roll a stale request forward to
+    a different day or week without saying so.
+    """
+
+    if signals.task_week_window:
+        monday = now.date() - timedelta(days=now.weekday())
+        if signals.task_week_window == "next":
+            monday += timedelta(days=7)
+        deadline = monday + timedelta(days=6)
+        reminder_day = monday + timedelta(days=week_weekday - 1)
+        preferred = _combine_local(reminder_day.isoformat(), week_clock, now)
+        if preferred <= now:
+            next_day = min(now.date() + timedelta(days=1), deadline)
+            preferred = _combine_local(next_day.isoformat(), day_clock, now)
+            if preferred <= now:
+                preferred = _next_whole_hour(now)
+        reminder = (
+            _reminder_iso(preferred)
+            if now < preferred and preferred.date() <= deadline
+            else ""
+        )
+        return deadline.isoformat(), "", reminder
+
+    if not signals.requested_date:
+        return "", "", ""
+    due_date = signals.requested_date
+    due_time = signals.requested_time
+    preferred = _combine_local(due_date, due_time or day_clock, now)
+    if preferred <= now and preferred.date() == now.date() and not due_time:
+        preferred = _next_whole_hour(now)
+    reminder = (
+        _reminder_iso(preferred)
+        if preferred > now and preferred.date().isoformat() == due_date
+        else ""
+    )
+    return due_date, due_time, reminder
+
+
 def extract_task_semantics(
     text: str, now: datetime, *, default_period: str = "",
 ) -> TaskSemanticSignals:
@@ -563,6 +642,7 @@ def extract_task_semantics(
         clock_conflict=clock_conflict,
         reminder_period=reminder_period,
         complex_recurrence=complex_recurrence,
+        task_week_window=_task_week_window(text),
     )
 
 
@@ -704,6 +784,8 @@ def _deterministic_plain_task_title(text: str) -> str:
         count=1,
     )
     candidate = _TASK_REQUEST_PREFIX_RE.sub("", candidate, count=1)
+    candidate = _TASK_WEEK_WINDOW_LEAD_RE.sub("", candidate, count=1)
+    candidate = re.sub(r"^\s*(?:内|之内|以内)?\s*", "", candidate, count=1)
     while candidate:
         updated = re.sub(r"^(?:在|从|到时候)\s*", "", candidate, count=1)
         matched = False
@@ -969,13 +1051,22 @@ def validate_plan_semantics(
     allow_enriched_note: bool = False,
     allow_explicit_task_fallback: bool = False,
     allow_daily: bool = False,
+    default_task_reminders: bool = False,
+    default_day_reminder_time: str = "09:00",
+    default_week_reminder_weekday: int = 5,
+    default_week_reminder_time: str = "16:00",
 ) -> GuardDecision:
     signals = extract_task_semantics(text, now)
     # Model fields are not source evidence. Clear them before *any* branch can
     # preserve a clarification draft, including missing-date/time and conflict
     # branches. A ready task receives only the validated source fields below.
     plan = replace(plan, tasks=tuple(
-        replace(task, reminder_at="", reminder_recurrence=None)
+        replace(
+            task,
+            reminder_at="",
+            reminder_recurrence=None,
+            local_only_reminder=False,
+        )
         for task in plan.tasks
     ))
 
@@ -1127,7 +1218,10 @@ def validate_plan_semantics(
     ):
         fallback_title = (
             _deterministic_plain_task_title(text)
-            if allow_explicit_task_fallback
+            if (
+                allow_explicit_task_fallback
+                or signals.task_week_window
+            )
             else ""
         )
         if len(_compact_grounding_text(fallback_title)) < 2:
@@ -1256,6 +1350,7 @@ def validate_plan_semantics(
                 due_time=task.due_time if signals.explicit_due else "",
                 reminder_at=first.isoformat(timespec="minutes"),
                 reminder_recurrence=recurrence,
+                local_only_reminder=True,
             )
             return GuardDecision(_with_task(plan, task))
         if signals.recurrence_frequency != "weekly":
@@ -1365,6 +1460,7 @@ def validate_plan_semantics(
             due_time=task.due_time if signals.explicit_due else "",
             reminder_at=first.isoformat(timespec="minutes"),
             reminder_recurrence=recurrence,
+            local_only_reminder=True,
         )
         return GuardDecision(_with_task(plan, task))
 
@@ -1422,6 +1518,35 @@ def validate_plan_semantics(
             due_time=task.due_time if signals.explicit_due else "",
             reminder_at=_reminder_iso(parsed),
             reminder_recurrence=None,
+            local_only_reminder=True,
+        )
+        return GuardDecision(_with_task(plan, task))
+
+    if default_task_reminders and (signals.requested_date or signals.task_week_window):
+        if signals.requested_time and signals.reminder_period == "unknown":
+            return _clarify(
+                plan,
+                ClarificationReason.MISSING_REMINDER_TIME,
+                "任务事项和日期已记住。这个钟点是上午还是下午？",
+                task,
+                reminder_date=signals.requested_date,
+                reminder_time=signals.requested_time,
+                reminder_period="unknown",
+            )
+        due_date, due_time, reminder_at = _default_task_schedule(
+            signals,
+            now,
+            day_clock=default_day_reminder_time,
+            week_weekday=default_week_reminder_weekday,
+            week_clock=default_week_reminder_time,
+        )
+        task = replace(
+            task,
+            due_date=due_date,
+            due_time=due_time,
+            reminder_at=reminder_at,
+            reminder_recurrence=None,
+            local_only_reminder=False,
         )
         return GuardDecision(_with_task(plan, task))
 
@@ -1440,6 +1565,7 @@ def validate_plan_semantics(
         due_time="",
         reminder_at="",
         reminder_recurrence=None,
+        local_only_reminder=False,
     )
     return GuardDecision(_with_task(plan, task))
 

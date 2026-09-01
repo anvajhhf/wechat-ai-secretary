@@ -1,0 +1,13 @@
+diff --git a/tools/mcp_oauth.py b/tools/mcp_oauth.py
+--- a/tools/mcp_oauth.py
++++ b/tools/mcp_oauth.py
+@@ -324,6 +324,9 @@ def _cached_redirect_uri(storage: "HermesTokenStorage | None") -> str | None:
+ 
+ def _is_interactive() -> bool:
+     """Return True if we can reasonably expect to interact with a user."""
++    mode = os.environ.get("HERMES_MCP_OAUTH_INTERACTIVE", "").strip().casefold()
++    if mode in {"0", "false", "no", "off"}:
++        return False
+     if not _oauth_interactive_enabled.get():
+         return False
+     if _oauth_interactive_forced.get():
