@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
@@ -131,32 +132,71 @@ class ReminderQueue:
         reminder_ats = (reminder_at,)
         if recurrence is not None:
             frequency = str(recurrence.frequency or "").strip().casefold()
-            if (
-                frequency != "weekly"
-                or recurrence.interval != 1
-                or recurrence.weekday not in _WEEKDAY_NAMES
-                or recurrence.count < 2
-                or recurrence.count > 52
-            ):
-                return ActionResult(
-                    action="reminder",
-                    status=ExecutionStatus.FAILED,
-                    summary=task.title,
-                    destination="微信",
-                    error="重复提醒规则无效；目前只支持每周一次、共 2 到 52 次",
+            if frequency == "daily":
+                slots = tuple(dict.fromkeys(str(item).strip() for item in recurrence.times))
+                if (
+                    recurrence.interval != 1
+                    or recurrence.weekday != 0
+                    or recurrence.count != 0
+                    or not 1 <= len(slots) <= 8
+                    or len(slots) != len(recurrence.times)
+                    or any(
+                        not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", slot)
+                        for slot in slots
+                    )
+                ):
+                    return ActionResult(
+                        action="reminder",
+                        status=ExecutionStatus.FAILED,
+                        summary=task.title,
+                        destination="微信",
+                        error="每天提醒规则无效；需要 1 到 8 个明确且不重复的钟点",
+                    )
+                start_date = reminder_at.date()
+                occurrences: list[datetime] = []
+                for slot in slots:
+                    hour, minute = (int(part) for part in slot.split(":", 1))
+                    candidate = reminder_at.replace(
+                        year=start_date.year,
+                        month=start_date.month,
+                        day=start_date.day,
+                        hour=hour,
+                        minute=minute,
+                        second=0,
+                        microsecond=0,
+                    )
+                    if candidate <= message.received_at.astimezone(self.settings.tz):
+                        candidate += timedelta(days=1)
+                    occurrences.append(candidate)
+                reminder_ats = tuple(sorted(occurrences))
+            else:
+                if (
+                    frequency != "weekly"
+                    or recurrence.interval != 1
+                    or recurrence.weekday not in _WEEKDAY_NAMES
+                    or recurrence.count < 2
+                    or recurrence.count > 52
+                    or recurrence.times
+                ):
+                    return ActionResult(
+                        action="reminder",
+                        status=ExecutionStatus.FAILED,
+                        summary=task.title,
+                        destination="微信",
+                        error="重复提醒规则无效；目前只支持每周一次、共 2 到 52 次",
+                    )
+                if reminder_at.isoweekday() != recurrence.weekday:
+                    return ActionResult(
+                        action="reminder",
+                        status=ExecutionStatus.FAILED,
+                        summary=task.title,
+                        destination="微信",
+                        error="首次提醒日期与每周重复星期不一致",
+                    )
+                reminder_ats = tuple(
+                    reminder_at + timedelta(weeks=index)
+                    for index in range(recurrence.count)
                 )
-            if reminder_at.isoweekday() != recurrence.weekday:
-                return ActionResult(
-                    action="reminder",
-                    status=ExecutionStatus.FAILED,
-                    summary=task.title,
-                    destination="微信",
-                    error="首次提醒日期与每周重复星期不一致",
-                )
-            reminder_ats = tuple(
-                reminder_at + timedelta(weeks=index)
-                for index in range(recurrence.count)
-            )
 
         try:
             changed, row_ids = self.ledger.enqueue_reminders(
@@ -165,6 +205,7 @@ class ReminderQueue:
                 reminder_ats,
                 replace_existing=replace_existing,
                 expected_snapshot=expected_snapshot,
+                recurrence=recurrence,
             )
         except ReminderRouteConflictError:
             return ActionResult(
@@ -186,6 +227,8 @@ class ReminderQueue:
         status = ExecutionStatus.PLANNED if self.settings.dry_run else ExecutionStatus.SUCCEEDED
         if recurrence is None:
             label = reminder_at.strftime("%Y-%m-%d %H:%M")
+        elif recurrence.frequency == "daily":
+            label = f"每天 {'、'.join(recurrence.times)}"
         else:
             weekday = _WEEKDAY_NAMES[recurrence.weekday]
             label = (
@@ -318,7 +361,7 @@ class ReminderScheduler:
             return "failed"
         except ReminderDeliveryUncertainError as exc:
             self.ledger.mark_reminders_uncertain(
-                (record.row_id for record in records), exc.reason_code
+                (record.row_id for record in records), exc.reason_code, observed_at=now
             )
             logger.warning("Reminder delivery result is uncertain: %s", exc.reason_code)
             return "uncertain"
@@ -329,6 +372,7 @@ class ReminderScheduler:
             self.ledger.mark_reminders_uncertain(
                 (record.row_id for record in records),
                 "delivery-outcome-unknown",
+                observed_at=now,
             )
             logger.warning(
                 "Reminder delivery raised an unclassified exception: %s",

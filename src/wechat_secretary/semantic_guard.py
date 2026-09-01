@@ -35,8 +35,9 @@ from .models import (
 
 _WEEKDAY_ISO = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "日": 7, "天": 7}
 _WEEKDAY_TEXT = {value: key for key, value in _WEEKDAY_ISO.items() if key != "天"}
+_DAILY_RE = re.compile(r"每天|每日")
 _UNSUPPORTED_RECURRENCE_RE = re.compile(
-    r"每天|每日|每月|每个月|每季度|每年|隔周|每两周|无限|一直提醒|长期提醒"
+    r"每月|每个月|每季度|每年|隔周|每两周|无限|一直提醒|长期提醒"
 )
 _WEEKLY_RE = re.compile(r"每(?:周|星期|礼拜)\s*([一二三四五六日天])")
 _BARE_WEEKLY_RE = re.compile(
@@ -64,6 +65,7 @@ _TASK_REQUEST_PREFIX_RE = re.compile(
 )
 _TASK_DATE_CONTROL_RE = re.compile(
     rf"(?:{_COMPLEX_WEEKLY_RE.pattern}|"
+    rf"{_DAILY_RE.pattern}|"
     rf"{_UNSUPPORTED_RECURRENCE_RE.pattern}|"
     rf"每(?:周|星期|礼拜)(?:\s*[一二三四五六日天]|\s*(?:都|固定))?|"
     rf"{DATE_TOKEN_RE.pattern})"
@@ -71,10 +73,15 @@ _TASK_DATE_CONTROL_RE = re.compile(
 _TASK_TIME_CONTROL_RE = CLOCK_TOKEN_RE
 _TASK_PERIOD_CONTROL_RE = PERIOD_TOKEN_RE
 _TASK_REPEAT_CONTROL_RE = re.compile(
-    r"(?:连续\s*[0-9一二两三四五六七八九十]{1,3}\s*(?:周|次)|"
-    r"(?:共|总共|一共)\s*[0-9一二两三四五六七八九十]{1,3}\s*次|"
+    r"(?:连续(?:提醒我?)?\s*[0-9零一二两三四五六七八九十]{1,3}\s*(?:周|次)|"
+    r"(?:共|总共|一共)\s*[0-9零一二两三四五六七八九十]{1,3}\s*次|"
+    r"[0-9零一二两三四五六七八九十]{1,3}\s*次\s*[，,、 ]*(?:总共|共)|"
     rf"{RELATIVE_TOKEN_RE.pattern})"
 )
+# Pending drafts historically use zero for an omitted total. Keep that meaning
+# for old rows, and reserve this non-executable value for an explicitly supplied
+# zero. It round-trips through the existing integer field without a migration.
+_PENDING_EXPLICIT_ZERO_COUNT = -1
 
 
 @dataclass(frozen=True)
@@ -83,11 +90,15 @@ class TaskSemanticSignals:
     negated_reminder: bool = False
     requested_date: str = ""
     requested_time: str = ""
+    requested_times: tuple[str, ...] = ()
     relative_reminder_at: str = ""
     recurrence_requested: bool = False
     recurrence_frequency: str = ""
+    recurrence_source: str = ""
     recurrence_weekday: int = 0
     repeat_count: int | None = None
+    repeat_count_conflict: bool = False
+    repeat_count_invalid: bool = False
     recurrence_start_explicit: bool = False
     explicit_due: bool = False
     identifiers: tuple[str, ...] = ()
@@ -135,10 +146,21 @@ def _split_leading_schedule(value: str) -> tuple[str, str]:
                     r"水|估计|透视", updated[found.end():]
                 ) and not found["period"]:
                     return candidate, "，".join(fragments)
+                if pattern is _TASK_REPEAT_CONTROL_RE and not RELATIVE_TOKEN_RE.fullmatch(found.group()):
+                    tail = updated[found.end():]
+                    # "连续三次询价" / "共三次报价" describe the activity,
+                    # unlike a separately delimited count or another control.
+                    if tail and not re.match(r"\s|[，,。.、；;！!]|提醒|通知|叫", tail) and not any(
+                        control.match(tail) for control in (
+                            _TASK_DATE_CONTROL_RE, _TASK_TIME_CONTROL_RE,
+                            _TASK_PERIOD_CONTROL_RE,
+                        )
+                    ):
+                        return candidate, "，".join(fragments)
                 fragments.append(found.group())
                 candidate = re.sub(
                     r"^\s*(?:的时候|时候)?\s*(?:开始)?\s*"
-                    r"(?:(?:[，,。.、；;！!和及]|或者|或)\s*)*",
+                    r"(?:(?:以及|或者|[，,。.、；;！!和及跟与]|或)\s*)*",
                     "", updated[found.end():],
                 )
                 break
@@ -162,9 +184,18 @@ def _split_trailing_schedule(value: str) -> tuple[str, str]:
                 rf"(?:{pattern.pattern})\s*(?:的时候|时候)?\s*(?:开始)?\s*$", candidate
             )
             if found:
+                if pattern is _TASK_REPEAT_CONTROL_RE and not RELATIVE_TOKEN_RE.fullmatch(found.group().strip()):
+                    prefix = candidate[:found.start()]
+                    if prefix and not re.search(r"[\s，,。.、；;！!]$", prefix):
+                        remainder, _ = _split_leading_schedule(prefix)
+                        if remainder:
+                            # A front-loaded body can itself end in a count:
+                            # "统计总共三次，明天下午两点提醒我".
+                            continue
                 fragments.insert(0, found.group())
                 candidate = re.sub(
-                    r"(?:(?:[\s，,。.、；;！!和及]|或者|或))+$", "", candidate[:found.start()]
+                    r"(?:(?:以及|或者|[\s，,。.、；;！!和及跟与]|或))+$",
+                    "", candidate[:found.start()],
                 )
                 break
         else:
@@ -172,7 +203,38 @@ def _split_trailing_schedule(value: str) -> tuple[str, str]:
     return candidate, "，".join(fragments)
 
 
-def _split_schedule_suffix(value: str) -> tuple[str, str]:
+def _split_attached_weekly_total(value: str, outer_schedule: str) -> tuple[str, str]:
+    """Allow punctuationless ASR totals only for an established weekly control.
+
+    This never scans task prose for a recurrence. Counting activities remain
+    ambiguous, and a total followed by more prose is not an outer control.
+    """
+    outer = mask_quoted_text(outer_schedule)
+    if (len(_WEEKLY_RE.findall(outer)) != 1 or _COMPLEX_WEEKLY_RE.search(outer)
+            or _UNSUPPORTED_RECURRENCE_RE.search(outer)):
+        return value, ""
+    tail = re.search(
+        r"(?P<total>(?:总共|一共|共)\s*[0-9零一二两三四五六七八九十]{1,3}\s*次)\s*(?:吧)?$",
+        mask_quoted_text(value),
+    )
+    if tail is None:
+        return value, ""
+    # Quote masking preserves positions by using spaces. Those spaces must
+    # not let a following quoted payload masquerade as trailing whitespace.
+    raw_tail = value[tail.start():]
+    if mask_quoted_text(raw_tail) != raw_tail:
+        return value, ""
+    body = value[:tail.start()].rstrip()
+    compact = _compact_grounding_text(body)
+    activity = re.sub(r"^(?:(?:请你|请|帮我|麻烦你|麻烦|劳驾)\s*)+", "", compact)
+    if (not _substantive_task_title(body)
+            or re.match(r"^(?:统计|累计|合计|计算|计数|总计)", activity)
+            or re.search(r"(?:共|总共|一共)[0-9零一二两三四五六七八九十]{1,3}次$", compact)):
+        return value, ""
+    return body, value[tail.start("total"):tail.end("total")]
+
+
+def _split_schedule_suffix(value: str, *, outer_schedule: str = "") -> tuple[str, str]:
     """Extract only independently delimited, entirely temporal tail clauses.
 
     Body sentences such as '查看明天下午的会议安排' and quoted times stay
@@ -186,6 +248,11 @@ def _split_schedule_suffix(value: str) -> tuple[str, str]:
             break
         boundary = boundaries[-1]
         tail = candidate[boundary.end():].strip()
+        # The established spoken order "三次，总共" is one control split
+        # across two clauses; do not leave its count stranded in the body.
+        if tail in {"共", "总共"} and len(boundaries) > 1:
+            boundary = boundaries[-2]
+            tail = candidate[boundary.end():].strip()
         if mask_quoted_text(tail) != tail:
             break
         remainder, schedule = _split_leading_schedule(tail)
@@ -193,6 +260,11 @@ def _split_schedule_suffix(value: str) -> tuple[str, str]:
             break
         fragments.insert(0, schedule)
         candidate = candidate[:boundary.start()].rstrip()
+    candidate, attached_total = _split_attached_weekly_total(
+        candidate, "，".join((outer_schedule, *fragments)),
+    )
+    if attached_total:
+        fragments.insert(0, attached_total)
     return candidate, "，".join(fragments)
 
 
@@ -200,8 +272,9 @@ def _reminder_body_source(text: str) -> str:
     marker = _reminder_marker(text)
     if marker is None:
         return text
-    body, _ = _split_leading_schedule(text[marker.end():])
-    body, _ = _split_schedule_suffix(body)
+    _, before = _split_trailing_schedule(text[:marker.start()])
+    body, after = _split_leading_schedule(text[marker.end():])
+    body, _ = _split_schedule_suffix(body, outer_schedule=f"{before}，{after}")
     if len(_compact_grounding_text(body)) < 2:
         body, _ = _split_trailing_schedule(text[:marker.start()])
     return body
@@ -215,10 +288,15 @@ def has_compound_reminder_body(text: str) -> bool:
 def _reminder_schedule_source(text: str) -> str:
     marker = _reminder_marker(text)
     if marker:
-        _, before = _split_trailing_schedule(text[:marker.start()])
+        prefix = text[:marker.start()]
+        repeat_verb = re.search(r"(?:一直|长期|重复|循环)\s*$", mask_quoted_text(prefix))
+        repeat_control = f"{repeat_verb.group().strip()}提醒" if repeat_verb else ""
+        if repeat_verb:
+            prefix = prefix[:repeat_verb.start()]
+        _, before = _split_trailing_schedule(prefix)
         body, after = _split_leading_schedule(text[marker.end():])
-        _, tail = _split_schedule_suffix(body)
-        return f"{before} 提醒我 {after}，{tail}"
+        _, tail = _split_schedule_suffix(body, outer_schedule=f"{before}，{after}")
+        return f"{before} {repeat_control} 提醒我 {after}，{tail}"
     # Quoted text never supplies scheduling fields on its own.
     return mask_quoted_text(text)
 
@@ -232,33 +310,89 @@ def _chinese_number(raw: str) -> int | None:
         return digits[raw]
     if raw == "十":
         return 10
-    if "十" in raw and len(raw) <= 3:
+    if re.fullmatch(r"[一二两三四五六七八九]?十[一二三四五六七八九]?", raw):
         left, right = raw.split("十", 1)
-        tens = digits.get(left, 1) if left else 1
-        ones = digits.get(right, 0) if right else 0
+        tens = digits[left] if left else 1
+        ones = digits[right] if right else 0
         return tens * 10 + ones
     return None
 
 
-def _repeat_count(text: str) -> int | None:
-    number = r"([0-9]{1,3}|[一二两三四五六七八九十]{1,3})"
+def _repeat_control_source(text: str) -> str:
+    """Read counts only from the outer schedule, never task prose or quotes."""
+    marker = _reminder_marker(text)
+    if marker is None:
+        # Count/time-only replies and leading controls on explicit task input.
+        _, leading = _split_leading_schedule(text)
+        _, tail = _split_schedule_suffix(text)
+        directly_bound = re.fullmatch(
+            r"\s*(?:再|还要|还|继续)?提醒(?:我)?\s*"
+            r"[0-9零一二两三四五六七八九十]{1,3}\s*次\s*[。.!！]?",
+            text,
+        )
+        return f"{leading}，{tail}，{directly_bound.group() if directly_bound else ''}"
+    _, before = _split_trailing_schedule(text[:marker.start()])
+    body, after = _split_leading_schedule(text[marker.end():])
+    _, tail = _split_schedule_suffix(body, outer_schedule=f"{before}，{after}")
+    direct = re.match(
+        r"\s*([0-9零一二两三四五六七八九十]{1,3}\s*次)(?!元|方)",
+        text[marker.end():],
+    )
+    # Keep the established "再提醒我三次" / "每周二提醒我一次..."
+    # grammar, whose bare count is explicitly bound to the reminder verb.
+    directly_bound = f"提醒我{direct.group(1)}" if direct else ""
+    return mask_quoted_text(f"{before}，{after}，{tail}，{directly_bound}")
+
+
+def _repeat_count_values(text: str) -> tuple[int | None, ...]:
+    """A None entry means an explicit unparseable count, not an omission."""
+    text = _repeat_control_source(text)
+    number = r"([0-9]{1,3}|[零一二两三四五六七八九十]{1,3})"
     patterns = (
         rf"(?:共|总共|一共)\s*{number}\s*次",
         rf"连续(?:提醒我?)?\s*{number}\s*(?:周|次)",
         rf"提醒我?\s*{number}\s*次",
         rf"{number}\s*次\s*[，,、 ]*(?:共|总共)",
     )
+    values: list[int | None] = []
     for index, pattern in enumerate(patterns):
         for match in re.finditer(pattern, text):
             value = _chinese_number(match.group(1))
             # “每周二提醒我一次”描述的是每次触发，不等于系列总次数。
             if index == 2 and value == 1:
                 continue
-            return value
-    week_count = re.search(
-        rf"连续\s*{number}\s*周", text
-    )
-    return _chinese_number(week_count.group(1)) if week_count else None
+            if value not in values:
+                values.append(value)
+    return tuple(values)
+
+
+def _repeat_count(text: str) -> int | None:
+    values = _repeat_count_values(text)
+    return values[0] if len(values) == 1 else None
+
+
+def _pending_count(value: int | None) -> int:
+    return _PENDING_EXPLICIT_ZERO_COUNT if value == 0 else value or 0
+
+
+def _unsupported_recurrence_question(signals: TaskSemanticSignals) -> str:
+    if signals.complex_recurrence:
+        return "目前还不支持每周多个星期几或星期范围，我没有截取其中一天。事项已记住，请改成单个星期几，或把各天分开发送。"
+    if signals.recurrence_source:
+        clocks = signals.requested_times or (
+            (signals.requested_time,) if signals.requested_time else ()
+        )
+        clock = f"，时间是{'、'.join(clocks)}" if clocks else ""
+        return (
+            f"我识别到的是“{signals.recurrence_source}”重复提醒{clock}，但当前暂不支持这种重复方式，尚未创建。"
+            "如果你想只在明天提醒一次，请回复“就明天一次”；也可以改成每周几，并说明总次数。"
+        )
+    if signals.repeat_count is not None:
+        return (
+            f"事项和{signals.repeat_count}次提醒的要求已保留，但还需要明确频率。"
+            "目前支持单个星期几的有限提醒，例如“每周二上午9点，共3次”。"
+        )
+    return "我识别到重复提醒，但还没有明确的频率和总次数。目前支持例如“每周二上午9点，共3次”。"
 
 
 def _period_for_clock(clock: str) -> str:
@@ -303,9 +437,38 @@ def extract_task_semantics(
         _resolve_time(found.group(), default_period=clock_period)
         for found in clock_tokens
     ]
-    requested_time = clock_values[0] if clock_values and all(clock_values) and len(set(clock_values)) == 1 else ""
+    daily = bool(_DAILY_RE.search(schedule))
+    exact_daily_clocks = bool(
+        daily
+        and clock_values
+        and len(clock_values) <= 8
+        and all(clock_values)
+        and len(set(clock_values)) == len(clock_values)
+        and all(
+            found["period"]
+            or found["colon"]
+            or found["dot"]
+            or int(value[:2]) == 0
+            or int(value[:2]) >= 13
+            or bool(clock_period)
+            for found, value in zip(clock_tokens, clock_values)
+        )
+    )
+    requested_times = tuple(dict.fromkeys(clock_values)) if exact_daily_clocks else ()
+    requested_time = (
+        clock_values[0]
+        if clock_values and all(clock_values) and len(set(clock_values)) == 1
+        else ""
+    )
     date_conflict = len(set(parsed_dates)) > 1
-    clock_conflict = (len(clock_tokens) > 1 and (not all(clock_values) or len(set(clock_values)) > 1)) or len(periods) > 1
+    if daily and len(clock_tokens) > 1:
+        clock_conflict = not exact_daily_clocks
+    else:
+        clock_conflict = len(clock_tokens) > 1 and (
+            not all(clock_values) or len(set(clock_values)) > 1
+        )
+    if len(periods) > 1 and not exact_daily_clocks:
+        clock_conflict = True
     conflicting_schedule = date_conflict or clock_conflict
     if invalid_date or date_conflict:
         requested_date = ""
@@ -317,18 +480,23 @@ def extract_task_semantics(
     # arbitrary words such as "检查每天备份的日志" in the reminder body.
     weekly = _WEEKLY_RE.search(schedule)
     bare_weekly = bool(_BARE_WEEKLY_RE.search(schedule))
-    marker = _reminder_marker(text)
-    recurrence_scope = mask_quoted_text(text[:marker.start()]) if marker else schedule
-    complex_recurrence = bool(_COMPLEX_WEEKLY_RE.search(schedule) or _COMPLEX_WEEKLY_RE.search(recurrence_scope))
-    unsupported = bool(_UNSUPPORTED_RECURRENCE_RE.search(schedule) or _UNSUPPORTED_RECURRENCE_RE.search(recurrence_scope))
-    repeat_count = _repeat_count(text)
+    complex_recurrence = bool(_COMPLEX_WEEKLY_RE.search(schedule))
+    daily_match = _DAILY_RE.search(schedule)
+    unsupported_match = _UNSUPPORTED_RECURRENCE_RE.search(schedule)
+    unsupported = bool(unsupported_match)
+    repeat_counts = _repeat_count_values(text)
+    repeat_count_conflict = len(repeat_counts) > 1
+    repeat_count_invalid = None in repeat_counts
+    repeat_count = repeat_counts[0] if len(repeat_counts) == 1 else None
     recurrence_requested = bool(
-        weekly or bare_weekly or unsupported or complex_recurrence
-        or re.search(r"重复提醒|循环提醒", recurrence_scope)
+        daily_match or weekly or bare_weekly or unsupported or complex_recurrence
+        or repeat_count_conflict or repeat_count_invalid
+        or re.search(r"重复提醒|循环提醒", schedule)
         or (repeat_count is not None and repeat_count != 1)
     )
     recurrence_frequency = (
-        "unsupported" if unsupported or complex_recurrence else "weekly" if weekly or bare_weekly else ""
+        "unsupported" if unsupported or complex_recurrence else
+        "daily" if daily_match else "weekly" if weekly or bare_weekly else ""
     )
     weekday = _WEEKDAY_ISO[weekly.group(1)] if weekly and not complex_recurrence else 0
     recurrence_start_explicit = bool(
@@ -346,10 +514,12 @@ def extract_task_semantics(
         requested_date = requested_time = relative = ""
     identifiers = tuple(dict.fromkeys(match.group(0) for match in _IDENTIFIER_RE.finditer(text)))
     explicit_24h = any(
-        found["colon"] or (value and (int(value[:2]) == 0 or int(value[:2]) >= 13))
+        found["colon"] or found["dot"]
+        or (value and (int(value[:2]) == 0 or int(value[:2]) >= 13))
         for found, value in zip(clock_tokens, clock_values)
     )
     reminder_period = (
+        "" if len(requested_times) > 1 else
         periods[0] if len(periods) == 1 else "ambiguous" if len(periods) > 1 else
         _period_for_clock(requested_time) if requested_time and explicit_24h else
         inherited_period if requested_time and inherited_period else
@@ -370,11 +540,18 @@ def extract_task_semantics(
         negated_reminder=negated_reminder,
         requested_date=requested_date,
         requested_time=requested_time,
+        requested_times=requested_times,
         relative_reminder_at=relative,
         recurrence_requested=recurrence_requested,
         recurrence_frequency=recurrence_frequency,
+        recurrence_source=(
+            unsupported_match.group() if unsupported_match else
+            daily_match.group() if daily_match else ""
+        ),
         recurrence_weekday=weekday,
         repeat_count=repeat_count,
+        repeat_count_conflict=repeat_count_conflict,
+        repeat_count_invalid=repeat_count_invalid,
         recurrence_start_explicit=recurrence_start_explicit,
         explicit_due=bool(_DUE_RE.search(text)),
         identifiers=identifiers,
@@ -450,7 +627,8 @@ def _missing_body_decision(
         recurrence = ReminderRecurrence(
             frequency=signals.recurrence_frequency,
             weekday=signals.recurrence_weekday,
-            count=signals.repeat_count or 0,
+            count=_pending_count(signals.repeat_count),
+            times=signals.requested_times,
         )
     date, clock = signals.requested_date, signals.requested_time
     if signals.relative_reminder_at:
@@ -458,6 +636,8 @@ def _missing_body_decision(
         date, clock = at.date().isoformat(), at.strftime("%H:%M")
     if recurrence and not signals.recurrence_start_explicit:
         date = ""
+    if signals.repeat_count_conflict or signals.repeat_count_invalid:
+        question += "另外，提醒总次数还不明确，之后还需要确认一个总次数。"
     return _clarify(
         plan, ClarificationReason.MISSING_TASK_BODY, question,
         TaskDraft("", reminder_at=signals.relative_reminder_at, reminder_recurrence=recurrence),
@@ -480,17 +660,11 @@ def _deterministic_task_title(text: str) -> str:
     prefix = source[: marker.start()] if marker else source
     suffix = source[marker.end() :] if marker else ""
 
-    candidate = _split_leading_schedule(suffix)[0] if marker else ""
-    candidate, _ = _split_schedule_suffix(candidate)
+    candidate, after = _split_leading_schedule(suffix) if marker else ("", "")
+    _, before = _split_trailing_schedule(prefix) if marker else ("", "")
+    candidate, _ = _split_schedule_suffix(candidate, outer_schedule=f"{before}，{after}")
     candidate = re.sub(r"^一下\s*", "", candidate)
     candidate = re.sub(r"^一次(?=.{2,})", "", candidate)
-    candidate = re.sub(
-        r"[，,、；;]?\s*(?:(?:共|总共|一共)\s*"
-        r"[0-9一二两三四五六七八九十]{1,3}\s*次|"
-        r"连续(?:提醒(?:我)?)?\s*[0-9一二两三四五六七八九十]{1,3}\s*(?:周|次))\s*$",
-        "",
-        candidate,
-    )
     if marker and len(_compact_grounding_text(candidate)) < 2:
         candidate = _split_trailing_schedule(prefix)[0]
     candidate = _strip_outer_request_politeness(candidate, text)
@@ -794,8 +968,16 @@ def validate_plan_semantics(
     expected_kind: IntentKind | None = None,
     allow_enriched_note: bool = False,
     allow_explicit_task_fallback: bool = False,
+    allow_daily: bool = False,
 ) -> GuardDecision:
     signals = extract_task_semantics(text, now)
+    # Model fields are not source evidence. Clear them before *any* branch can
+    # preserve a clarification draft, including missing-date/time and conflict
+    # branches. A ready task receives only the validated source fields below.
+    plan = replace(plan, tasks=tuple(
+        replace(task, reminder_at="", reminder_recurrence=None)
+        for task in plan.tasks
+    ))
 
     if signals.negated_reminder:
         return _clarify(
@@ -965,10 +1147,29 @@ def validate_plan_semantics(
             f"我没有可靠保留关键标识“{'、'.join(missing_identifiers)}”，为避免建错任务，请确认后重发。",
         )
 
+    if signals.repeat_count_conflict or signals.repeat_count_invalid:
+        task = replace(task, reminder_at="", reminder_recurrence=ReminderRecurrence(
+            frequency=signals.recurrence_frequency,
+            weekday=signals.recurrence_weekday,
+            count=0,
+            times=signals.requested_times,
+        ))
+        return _clarify(
+            plan, ClarificationReason.MISSING_RECURRENCE_COUNT,
+            "我没有可靠识别出提醒总次数，没有创建。事项和时间已保留，请说明一个明确整数，例如“共3次”。"
+            if signals.repeat_count_invalid else
+            "我识别到了不同的提醒总次数，没有创建。事项和时间已保留，请确认一个总次数，例如“共3次”。",
+            task,
+            reminder_date=signals.requested_date if signals.recurrence_start_explicit else "",
+            reminder_time=signals.requested_time,
+            reminder_period=signals.reminder_period,
+        )
     if signals.conflicting_schedule or signals.invalid_date:
         if signals.recurrence_requested:
             task = replace(task, reminder_recurrence=ReminderRecurrence(
-                weekday=signals.recurrence_weekday, count=signals.repeat_count or 0,
+                frequency=signals.recurrence_frequency,
+                weekday=signals.recurrence_weekday, count=_pending_count(signals.repeat_count),
+                times=signals.requested_times,
             ))
         return _clarify(
             plan,
@@ -990,18 +1191,89 @@ def validate_plan_semantics(
                 ClarificationReason.UNSUPPORTED_RECURRENCE,
                 "我识别到了重复任务，但当前只支持明确说出的有限微信提醒。若你需要提醒，请说“每周二上午9点提醒我……，共3次”。",
             )
-        if signals.recurrence_frequency != "weekly":
-            pending_task = replace(task, reminder_at="", reminder_recurrence=ReminderRecurrence(
-                frequency=signals.recurrence_frequency,
+        if signals.recurrence_frequency == "daily" and allow_daily:
+            recurrence = ReminderRecurrence(
+                frequency="daily",
+                interval=1,
                 weekday=0,
-                count=signals.repeat_count or 0,
+                count=0,
+                times=signals.requested_times,
+            )
+            pending_task = replace(
+                task, reminder_at="", reminder_recurrence=recurrence,
+            )
+            if signals.repeat_count is not None:
+                return _clarify(
+                    plan,
+                    ClarificationReason.UNSUPPORTED_RECURRENCE,
+                    "我已识别到每天提醒，但同时出现了总次数。请确认是长期每天提醒，还是改成有限次数。",
+                    pending_task,
+                    reminder_date=(
+                        signals.requested_date
+                        if signals.recurrence_start_explicit else ""
+                    ),
+                )
+            if not signals.requested_times:
+                return _clarify(
+                    plan,
+                    ClarificationReason.MISSING_REMINDER_TIME,
+                    "我已识别到每天提醒，还需要一个或多个明确钟点，例如“早上8:30、晚上7点”。",
+                    pending_task,
+                    reminder_date=(
+                        signals.requested_date
+                        if signals.recurrence_start_explicit else ""
+                    ),
+                    reminder_time=signals.requested_time,
+                    reminder_period=signals.reminder_period,
+                )
+            start_date = (
+                datetime.fromisoformat(signals.requested_date).date()
+                if signals.recurrence_start_explicit and signals.requested_date
+                else now.date()
+            )
+            if start_date < now.date():
+                return _clarify(
+                    plan,
+                    ClarificationReason.SEMANTIC_MISMATCH,
+                    "每天提醒的开始日期已经过去，请给我今天或之后的开始日期。",
+                    pending_task,
+                )
+            occurrences: list[datetime] = []
+            for clock in signals.requested_times:
+                hour, minute = (int(part) for part in clock.split(":", 1))
+                candidate = datetime.combine(
+                    start_date,
+                    datetime.min.time(),
+                    tzinfo=now.tzinfo,
+                ).replace(hour=hour, minute=minute)
+                if candidate <= now:
+                    candidate += timedelta(days=1)
+                occurrences.append(candidate)
+            first = min(occurrences)
+            task = replace(
+                task,
+                due_date=task.due_date if signals.explicit_due else "",
+                due_time=task.due_time if signals.explicit_due else "",
+                reminder_at=first.isoformat(timespec="minutes"),
+                reminder_recurrence=recurrence,
+            )
+            return GuardDecision(_with_task(plan, task))
+        if signals.recurrence_frequency != "weekly":
+            stored_frequency = (
+                "unsupported"
+                if signals.recurrence_frequency == "daily" else
+                signals.recurrence_frequency
+            )
+            pending_task = replace(task, reminder_at="", reminder_recurrence=ReminderRecurrence(
+                frequency=stored_frequency,
+                weekday=0,
+                count=_pending_count(signals.repeat_count),
+                times=signals.requested_times,
             ))
             return _clarify(
                 plan,
                 ClarificationReason.UNSUPPORTED_RECURRENCE,
-                "目前还不支持每周多个星期几或星期范围，我没有截取其中一天。事项已记住，请改成单个星期几，或把各天分开发送。"
-                if signals.complex_recurrence else
-                "我记住了事项和次数，但还需要明确频率。目前支持单个星期几的有限提醒，例如“每周二上午9点，共3次”。",
+                _unsupported_recurrence_question(signals),
                 pending_task,
                 reminder_date=signals.requested_date if signals.recurrence_start_explicit else "",
                 reminder_time=signals.requested_time,
@@ -1011,7 +1283,7 @@ def validate_plan_semantics(
             frequency="weekly",
             interval=1,
             weekday=signals.recurrence_weekday,
-            count=signals.repeat_count or 0,
+            count=_pending_count(signals.repeat_count),
         )
         pending_task = replace(task, reminder_recurrence=recurrence, reminder_at="")
         recurrence_start_date = (
@@ -1184,6 +1456,74 @@ def looks_like_pending_followup(text: str) -> bool:
     return _only_pending_fields(_corrected_pending_fields(text))
 
 
+def _pending_one_off_fields(text: str) -> str | None:
+    """Recognize a body-free replacement of a pending repeat with one event.
+
+    This is not a general task route. Quotes, questions and any new payload
+    make it ineligible, so a new full reminder never borrows an older title.
+    """
+    candidate = re.sub(r"\s+", "", text).strip("，,。.!！；;")
+    if (
+        not candidate or len(candidate) > 80
+        or mask_quoted_text(candidate) != candidate
+        or re.search(r"[?？]|怎么|如何|为什么|是否|吗|么|呢", candidate)
+    ):
+        return None
+
+    recurrence_only = re.compile(
+        rf"(?:{_DAILY_RE.pattern}|{_UNSUPPORTED_RECURRENCE_RE.pattern}|{_WEEKLY_RE.pattern}|"
+        r"每周|重复提醒|循环提醒|重复|循环)"
+    )
+    corrected = re.fullmatch(
+        r"(?:不对[，,]?)?不是(.+?)[，,]?(?:而是|是|改成|换成)(.+)",
+        candidate,
+    )
+    reverse = re.fullmatch(r"(.+?)[，,]?不是(.+)", candidate)
+    if corrected or reverse:
+        rejected, replacement = (
+            corrected.groups() if corrected else tuple(reversed(reverse.groups()))
+        )
+        if not recurrence_only.fullmatch(rejected.strip("，,")):
+            return None
+        fields = replacement.strip("，,")
+        if is_pending_cancellation(fields):
+            return None
+        if _only_pending_fields(fields) and (DATE_TOKEN_RE.search(fields) or RELATIVE_TOKEN_RE.search(fields)) and not (
+            recurrence_only.search(fields) or re.search(r"次", fields)
+        ):
+            # "不是每周二，是周三" changes a weekly day, not its cadence.
+            if _WEEKLY_RE.fullmatch(rejected.strip("，,")) and re.fullmatch(
+                r"(?:周|星期|礼拜)[一二三四五六日天]", fields
+            ):
+                return None
+            return fields
+        # The positive side may spell out "明天提醒我一次" as well.
+        candidate = fields
+
+    if not re.search(
+        r"一次性|单次|(?:只|仅|就).*(?:一|1)次|(?:提醒|通知)(?:我)?(?:一|1)次",
+        candidate,
+    ):
+        return None
+    fields = re.sub(r"一次性|单次|(?:提醒|通知)(?:我)?|(?:一|1)次", "", candidate)
+    fields = re.sub(
+        r"请|麻烦|帮我|改成|改为|换成|设为|设置为|只在|仅在|只|仅|就|在",
+        "", fields,
+    )
+    fields = re.sub(r"(?:就行|即可|吧)$", "", fields).strip("，,；;")
+    if not fields:
+        return ""
+    if not is_pending_cancellation(fields) and _only_pending_fields(fields) and not (
+        recurrence_only.search(fields) or re.search(r"次", fields)
+    ):
+        return fields
+    return None
+
+
+def looks_like_pending_correction(text: str) -> bool:
+    return _pending_one_off_fields(text) is not None
+
+
 def _only_pending_fields(text: str) -> bool:
     compact = re.sub(r"\s+", "", text).rstrip("。.!！")
     if is_pending_cancellation(compact):
@@ -1207,7 +1547,7 @@ def _only_pending_fields(text: str) -> bool:
         DATE_TOKEN_RE.pattern,
         CLOCK_TOKEN_RE.pattern,
         _TASK_PERIOD_CONTROL_RE.pattern,
-        r"(?:(?:共|总共|一共|连续)?[0-9一二两三四五六七八九十]{1,3}(?:次|周))",
+        r"(?:(?:共|总共|一共|连续)?[0-9零一二两三四五六七八九十]{1,3}(?:次|周))",
     )
     found_field = False
     for pattern in field_patterns:
@@ -1268,17 +1608,25 @@ def _pending_weekday(text: str) -> int:
     return _WEEKDAY_ISO[match.group(1)] if match else 0
 
 
-def _pending_repeat_count(text: str) -> int | None:
+def _pending_repeat_counts(text: str) -> tuple[int | None, ...]:
     text = text.strip().rstrip("。.!！")
-    parsed = _repeat_count(text)
-    if parsed is not None:
-        return parsed
-    match = re.fullmatch(
-        r"\s*(?:共|总共|一共|连续)?\s*"
-        r"([0-9]{1,3}|[一二两三四五六七八九十]{1,3})\s*(?:次|周)\s*",
-        text,
-    )
-    return _chinese_number(match.group(1)) if match else None
+    values = list(_repeat_count_values(text))
+    if _only_pending_fields(text):
+        # A body-free followup may omit 共: "三次或四次". These cannot be
+        # discarded as omissions, or an older valid count could execute.
+        fields = RELATIVE_TOKEN_RE.sub("", text)
+        for match in re.finditer(
+            r"([0-9]{1,3}|[零一二两三四五六七八九十]{1,3})\s*(?:次|周)", fields,
+        ):
+            value = _chinese_number(match.group(1))
+            if value not in values:
+                values.append(value)
+    return tuple(values)
+
+
+def _pending_repeat_count(text: str) -> int | None:
+    values = _pending_repeat_counts(text)
+    return values[0] if len(values) == 1 else None
 
 
 def _pending_explicit_start_date(text: str, resolved: str) -> str:
@@ -1298,10 +1646,14 @@ def resume_pending_task(
     text: str,
     now: datetime,
 ) -> GuardDecision:
-    text = _corrected_pending_fields(text)
+    one_off_fields = _pending_one_off_fields(text)
+    explicit_one_off = one_off_fields is not None
+    text = one_off_fields if explicit_one_off else _corrected_pending_fields(text)
     task = pending.task
+    if explicit_one_off:
+        task = replace(task, reminder_at="", reminder_recurrence=None)
     is_body_reply = not task.title and looks_like_pending_body(text)
-    if not is_body_reply and not looks_like_pending_followup(text):
+    if not explicit_one_off and not is_body_reply and not looks_like_pending_followup(text):
         return GuardDecision(
             plan=IntentPlan(kind=IntentKind.CLARIFY, clarification_reason=pending.reason),
             reason=pending.reason,
@@ -1333,12 +1685,38 @@ def resume_pending_task(
     if signals.relative_reminder_at:
         relative = datetime.fromisoformat(signals.relative_reminder_at)
         reminder_date, reminder_time = relative.date().isoformat(), relative.strftime("%H:%M")
+    supplied_counts = () if is_body_reply or explicit_one_off else _pending_repeat_counts(text)
+    supplied_count = supplied_counts[0] if len(supplied_counts) == 1 else None
     plan = IntentPlan(kind=IntentKind.TASK, tasks=(task,), confidence=1.0)
+    supplied_count_invalid = None in supplied_counts
+    if (signals.repeat_count_conflict or signals.repeat_count_invalid
+            or len(supplied_counts) > 1 or supplied_count_invalid):
+        recurrence = task.reminder_recurrence or ReminderRecurrence(frequency="")
+        frequency = signals.recurrence_frequency or recurrence.frequency
+        weekday = signals.recurrence_weekday or _pending_weekday(text) or recurrence.weekday
+        if signals.complex_recurrence:
+            frequency, weekday = "unsupported", 0
+        elif not frequency and _pending_weekday(text):
+            frequency = "weekly"
+        # Drop the old count as well as the conflicting replacements. A later
+        # time-only reply must not revive a previously valid total and execute.
+        task = replace(task, reminder_at="", reminder_recurrence=replace(
+            recurrence, frequency=frequency, weekday=weekday, count=0,
+        ))
+        return _clarify(
+            plan, ClarificationReason.MISSING_RECURRENCE_COUNT,
+            "这次补充的提醒总次数不明确，没有创建。事项和时间已保留，请说明一个明确整数，例如“共3次”。"
+            if signals.repeat_count_invalid or supplied_count_invalid else
+            "这次补充的提醒总次数有冲突，没有创建。事项和时间已保留，请确认一个总次数，例如“共3次”。",
+            task, reminder_date=reminder_date, reminder_time=reminder_time,
+            reminder_period=period,
+        )
     anchored_at = (
         signals.relative_reminder_at
         or (pending.task.reminder_at if is_body_reply and not pending.task.reminder_recurrence else "")
     )
-    if anchored_at and task.title and task.reminder_recurrence is None:
+    if (anchored_at and task.title and task.reminder_recurrence is None
+            and supplied_count is None and not signals.recurrence_requested):
         anchored = datetime.fromisoformat(anchored_at).astimezone(now.tzinfo)
         if anchored > now:
             return GuardDecision(_with_task(plan, replace(task, reminder_at=_reminder_iso(anchored))))
@@ -1362,12 +1740,11 @@ def resume_pending_task(
             reminder_period=period,
         )
     recurrence = task.reminder_recurrence
-    supplied_count = None if is_body_reply else _pending_repeat_count(text)
     if recurrence is None and (signals.recurrence_requested or supplied_count is not None):
         recurrence = ReminderRecurrence(
             frequency=signals.recurrence_frequency,
             weekday=signals.recurrence_weekday,
-            count=supplied_count if supplied_count is not None else signals.repeat_count or 0,
+            count=_pending_count(supplied_count if supplied_count is not None else signals.repeat_count),
         )
     if recurrence is not None:
         reminder_date = (
@@ -1375,7 +1752,7 @@ def resume_pending_task(
             if signals.date_supplied else pending.reminder_date
         )
         weekday = signals.recurrence_weekday or (0 if is_body_reply else _pending_weekday(text)) or recurrence.weekday
-        count = supplied_count if supplied_count is not None else recurrence.count
+        count = _pending_count(supplied_count) if supplied_count is not None else recurrence.count
         frequency = recurrence.frequency
         if signals.complex_recurrence:
             frequency, weekday = "unsupported", 0
@@ -1386,20 +1763,41 @@ def resume_pending_task(
         recurrence = replace(recurrence, frequency=frequency, weekday=weekday, count=count)
         task = replace(task, reminder_recurrence=recurrence)
         if frequency != "weekly":
+            if signals.date_supplied and not signals.recurrence_requested:
+                question = (
+                    "日期和原来的事项、时间已保留。你是只想在这一天提醒一次，还是修改重复提醒的开始日期？"
+                    "若只需一次，请回复“就明天一次”或“改成一次性，具体日期和时间”。"
+                )
+            elif signals.recurrence_source:
+                question = _unsupported_recurrence_question(signals)
+            elif count == 0:
+                question = (
+                    "事项和时间已保留，但原先的重复方式暂不支持。"
+                    "如果只需一次，请回复“就明天一次”；若要每周提醒，请说明星期几和总次数。"
+                )
+            else:
+                question = (
+                    "事项和提醒次数要求已保留，请明确提醒频率。"
+                    "目前支持单个星期几，例如“每周二”，不会把次数当成新事项。"
+                )
             return _clarify(
                 plan, ClarificationReason.MISSING_TASK_BODY if not task.title else ClarificationReason.UNSUPPORTED_RECURRENCE,
-                "提醒次数和时间已保留，请先补充具体要提醒什么。" if not task.title else
+                "重复提醒的草稿已保留，请先补充具体要提醒什么。" if not task.title else
                 "事项和其它信息已保留，目前不支持多个星期几或星期范围。请确认单个星期几，例如“每周二”。"
                 if signals.complex_recurrence else
-                "事项和次数已保留，请明确提醒频率。目前支持单个星期几，例如“每周二”，不会把次数当成新事项。",
+                question,
                 task, reminder_date=reminder_date, reminder_time=reminder_time,
                 reminder_period=period,
             )
         weekday_text = _WEEKDAY_TEXT.get(weekday, "")
         start = f"{reminder_date} 开始，" if reminder_date else ""
         clock = _pending_clock_text(reminder_time, period)
+        count_clause = (
+            "，共0次" if count == _PENDING_EXPLICIT_ZERO_COUNT else
+            f"，共{count}次" if count > 0 else ""
+        )
         canonical = (
-            f"{start}每周{weekday_text} {clock}提醒我{task.title}，共{count}次"
+            f"{start}每周{weekday_text} {clock}提醒我{task.title}{count_clause}"
         )
     else:
         clock = _pending_clock_text(reminder_time, period)

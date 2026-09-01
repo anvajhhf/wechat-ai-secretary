@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
+import importlib.metadata
 import importlib.util
+import io
 import json
+import logging
 import os
 import shutil
 import sys
+import warnings
 from collections.abc import Callable
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from pathlib import Path
 
@@ -98,6 +104,135 @@ def _safe_path_state(path: Path | None) -> str:
     return f"已配置，{'存在' if path.exists() else '不存在'}"
 
 
+def _speech_readiness(settings: SecretarySettings) -> tuple[str, tuple[str, ...]]:
+    """Inspect the selected local backend without decoding or loading models."""
+    if not settings.voice_asr_enabled:
+        return "未启用", ()
+    # Import-time warnings/logs can expose library paths or environment values
+    # before an exception is sanitized. Doctor is a standalone CLI check, so
+    # silence these diagnostics temporarily and restore its process state.
+    stdout, stderr = sys.stdout, sys.stderr
+    captured_out, captured_err = io.StringIO(), io.StringIO()
+    disabled = logging.root.manager.disable
+    try:
+        with redirect_stdout(captured_out), redirect_stderr(captured_err), warnings.catch_warnings():
+            logging.disable(max(disabled, logging.CRITICAL))
+            warnings.simplefilter("ignore")
+            return _probe_local_speech(settings)
+    finally:
+        # Some dependencies register StreamHandlers during import. Do not
+        # leave them attached to a temporary stream after this check returns.
+        loggers = [logging.root, *list(logging.root.manager.loggerDict.values())]
+        for logger in loggers:
+            if not isinstance(logger, logging.Logger):
+                continue
+            for handler in logger.handlers:
+                if isinstance(handler, logging.StreamHandler):
+                    if handler.stream is captured_out:
+                        handler.setStream(stdout)
+                    elif handler.stream is captured_err:
+                        handler.setStream(stderr)
+        captured_out.close()
+        captured_err.close()
+        logging.disable(disabled)
+
+
+def _probe_local_speech(settings: SecretarySettings) -> tuple[str, tuple[str, ...]]:
+    """Dependency imports and file checks only; callers suppress diagnostics."""
+    names = {"whisper": "Whisper", "sensevoice": "SenseVoice", "paraformer": "Paraformer"}
+    backend = settings.asr_backend
+    if not isinstance(backend, str) or backend not in names:
+        return "未就绪", ("本地语音后端配置无效",)
+    label = names[backend]
+    errors: list[str] = []
+
+    def require_module(name: str, attributes: tuple[str, ...]) -> object | None:
+        try:
+            module = importlib.import_module(name)
+            if not all(callable(getattr(module, item, None)) for item in attributes):
+                raise ValueError("missing-local-component-api")
+            return module
+        except Exception:
+            # Native import errors can include DLL paths, environment details
+            # or credentials. Readiness output must not repeat their contents.
+            errors.append(f"本地语音组件 {name} 缺失或不可用")
+            return None
+
+    require_module("av", ("open", "AudioResampler"))
+    require_module("numpy", ("ascontiguousarray", "isfinite"))
+    require_module("pysilk", ("decode",))
+    ort = require_module("onnxruntime", ("InferenceSession", "get_available_providers"))
+    if ort is not None:
+        try:
+            if "CPUExecutionProvider" not in ort.get_available_providers():
+                raise ValueError("missing-cpu-provider")
+        except Exception:
+            errors.append("本地语音组件 onnxruntime 的 CPU 后端不可用")
+    whisper = require_module(
+        "faster_whisper", ("WhisperModel",) if backend == "whisper" else (),
+    )
+    if whisper is not None:
+        try:
+            utils = importlib.import_module("faster_whisper.utils")
+            vad = importlib.import_module("faster_whisper.vad")
+            if not all(callable(getattr(vad, item, None)) for item in (
+                "VadOptions", "get_speech_timestamps",
+            )):
+                raise ValueError("missing-vad-api")
+            assets = Path(utils.get_assets_path()).resolve(strict=True)
+            asset = (assets / "silero_vad_v6.onnx").resolve(strict=True)
+            if not asset.is_relative_to(assets) or not asset.is_file() or asset.stat().st_size <= 0:
+                raise ValueError("missing-vad-asset")
+            with asset.open("rb") as source:
+                if not source.read(1):
+                    raise ValueError("empty-vad-asset")
+        except Exception:
+            errors.append("本地 Silero VAD 组件或模型文件缺失、不可读取")
+
+    try:
+        if backend == "whisper":
+            from .speech import LocalSpeechTranscriber
+
+            transcriber = LocalSpeechTranscriber(settings)
+            transcriber._decode_options()
+            # Use the exact runtime cache selection (including aliases and
+            # refs), never HF_HOME or an arbitrary stale snapshot. The helper
+            # is explicitly local_files_only and cannot download a model.
+            cached = transcriber._resolve_model_path()
+            allowed = settings.project_root.resolve() / "runtime" / "models" / "huggingface" / "hub"
+            if not cached.is_relative_to(allowed):
+                raise ValueError("model-outside-project-cache")
+        else:
+            from .speech_onnx import OnnxSpeechTranscriber
+
+            transcriber = OnnxSpeechTranscriber(settings)
+            transcriber._validate_settings()
+            transcriber._resolve_model_files()
+    except Exception:
+        errors.append(f"{label} 本地语音参数或模型缓存校验未通过")
+
+    if backend != "whisper":
+        versions_ready = True
+        for distribution in ("sherpa-onnx", "sherpa-onnx-core"):
+            try:
+                if importlib.metadata.version(distribution) != "1.13.6":
+                    raise ValueError("unexpected-sherpa-version")
+            except Exception:
+                versions_ready = False
+                errors.append(f"本地语音组件 {distribution} 必须完整安装为 1.13.6")
+        if versions_ready:
+            sherpa = require_module("sherpa_onnx", ())
+            if sherpa is not None:
+                try:
+                    factory = "from_sense_voice" if backend == "sensevoice" else "from_paraformer"
+                    if (sherpa.__version__ != "1.13.6"
+                            or not callable(getattr(sherpa.OfflineRecognizer, factory, None))):
+                        raise ValueError("unexpected-sherpa-api")
+                except Exception:
+                    errors.append("本地 sherpa-onnx 组件版本或识别接口不匹配")
+    return f"{label}：{'未就绪' if errors else '已就绪'}", tuple(errors)
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     try:
         settings = load_settings(PROJECT_ROOT)
@@ -137,39 +272,14 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"本地微信提醒：{'已启用' if settings.reminders_enabled else '未启用'}")
     print(f"公开链接笔记：{'已启用' if settings.web_enabled else '未启用'}")
     pillow_found = importlib.util.find_spec("PIL") is not None
-    whisper_found = importlib.util.find_spec("faster_whisper") is not None
-    silk_found = importlib.util.find_spec("pysilk") is not None
     print(
         f"图片安全预处理：{'已就绪' if pillow_found and settings.vision_enabled else '未就绪'}"
     )
-    print(
-        f"本地语音转写：{'已就绪' if whisper_found and silk_found and settings.voice_asr_enabled else '未就绪'}"
-    )
-    model_home_value = os.getenv("HF_HOME", "").strip()
-    whisper_cache_ready = False
-    if model_home_value:
-        snapshots = (
-            Path(model_home_value)
-            / "hub"
-            / f"models--Systran--faster-whisper-{settings.asr_model}"
-            / "snapshots"
-        )
-        if snapshots.is_dir():
-            for snapshot in snapshots.iterdir():
-                model_file = snapshot / "model.bin"
-                if (
-                    snapshot.is_dir()
-                    and (snapshot / "config.json").is_file()
-                    and (snapshot / "tokenizer.json").is_file()
-                    and model_file.is_file()
-                    and model_file.stat().st_size > 10 * 1024 * 1024
-                ):
-                    whisper_cache_ready = True
-                    break
-    print(
-        f"Whisper {settings.asr_model} 模型："
-        f"{'已完整缓存' if whisper_cache_ready else '尚未完整缓存'}"
-    )
+    speech_state, speech_errors = _speech_readiness(settings)
+    print(f"本地语音转写：{speech_state}")
+    if not args.strict:
+        for error in speech_errors:
+            print(f"语音待就绪项：{error}")
     errors = settings.runtime_errors(
         strict=args.strict,
         require_write_approval=args.strict,
@@ -182,12 +292,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         errors.append("Hermes 项目插件入口缺失")
     if args.strict and settings.vision_enabled and not pillow_found:
         errors.append("图片安全预处理依赖 Pillow 未安装")
-    if args.strict and settings.voice_asr_enabled and not whisper_found:
-        errors.append("本地语音依赖 faster-whisper 未安装")
-    if args.strict and settings.voice_asr_enabled and not silk_found:
-        errors.append("微信 .silk 解码依赖 silk-python 未安装")
-    if args.strict and settings.voice_asr_enabled and not whisper_cache_ready:
-        errors.append(f"Whisper {settings.asr_model} 模型尚未完整缓存")
+    if args.strict:
+        errors.extend(speech_errors)
     for error in errors:
         print(f"阻止项：{error}")
     return 1 if errors else 0

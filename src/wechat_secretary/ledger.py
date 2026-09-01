@@ -222,6 +222,10 @@ class IdempotencyLedger:
                     delivered_at TEXT NOT NULL DEFAULT '',
                     delivered_message_id TEXT NOT NULL DEFAULT '',
                     last_error_code TEXT NOT NULL DEFAULT '',
+                    recurrence_frequency TEXT NOT NULL DEFAULT '',
+                    recurrence_interval INTEGER NOT NULL DEFAULT 0,
+                    recurrence_slot TEXT NOT NULL DEFAULT '',
+                    recurrence_active INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(task_id, reminder_at)
                 );
                 CREATE INDEX IF NOT EXISTS idx_reminders_due
@@ -261,6 +265,21 @@ class IdempotencyLedger:
                 self._connection.execute(
                     "ALTER TABLE pending_completion ADD COLUMN observed_at TEXT NOT NULL DEFAULT ''"
                 )
+            reminder_columns = {
+                str(row["name"])
+                for row in self._connection.execute("PRAGMA table_info(reminders)")
+            }
+            reminder_migrations = (
+                ("recurrence_frequency", "TEXT NOT NULL DEFAULT ''"),
+                ("recurrence_interval", "INTEGER NOT NULL DEFAULT 0"),
+                ("recurrence_slot", "TEXT NOT NULL DEFAULT ''"),
+                ("recurrence_active", "INTEGER NOT NULL DEFAULT 0"),
+            )
+            for column, definition in reminder_migrations:
+                if column not in reminder_columns:
+                    self._connection.execute(
+                        f"ALTER TABLE reminders ADD COLUMN {column} {definition}"
+                    )
 
     @staticmethod
     def _hash(value: str) -> str:
@@ -858,6 +877,15 @@ class IdempotencyLedger:
                 interval=int(recurrence_raw.get("interval", 1)),
                 weekday=int(recurrence_raw.get("weekday", 0)),
                 count=int(recurrence_raw.get("count", 0)),
+                times=(
+                    tuple(
+                        str(item)[:5]
+                        for item in recurrence_raw.get("times", [])[:8]
+                        if isinstance(item, str)
+                    )
+                    if isinstance(recurrence_raw.get("times", []), list)
+                    else ()
+                ),
             )
         task = TaskDraft(
             title=str(raw.get("title", ""))[:300],
@@ -1127,6 +1155,14 @@ class IdempotencyLedger:
                     conversation_hashes.update(self._hash(f"{sender_key}:{chat[0]}") for chat in chats)
                     self._connection.execute(
                         """
+                        UPDATE reminders SET recurrence_active = 0
+                        WHERE task_id = ? AND platform = ? AND account_id = ?
+                          AND user_id = ?
+                        """,
+                        (task_id, route[0], route[1], route[2]),
+                    )
+                    self._connection.execute(
+                        """
                         UPDATE reminders SET status = 'cancelled'
                         WHERE task_id = ? AND platform = ? AND account_id = ?
                           AND user_id = ?
@@ -1135,6 +1171,10 @@ class IdempotencyLedger:
                         (task_id, route[0], route[1], route[2]),
                     )
                 else:
+                    self._connection.execute(
+                        "UPDATE reminders SET recurrence_active = 0 WHERE task_id = ?",
+                        (task_id,),
+                    )
                     self._connection.execute(
                         """
                         UPDATE reminders SET status = 'cancelled'
@@ -1160,6 +1200,70 @@ class IdempotencyLedger:
             str(row["account_id"]),
             str(row["user_id"]),
             str(row["chat_id"]),
+        )
+
+    def _advance_daily_reminder_locked(
+        self,
+        row: sqlite3.Row,
+        observed_at: datetime,
+    ) -> None:
+        """Move one active daily slot to its next future occurrence atomically."""
+
+        if (
+            int(row["recurrence_active"] or 0) != 1
+            or str(row["recurrence_frequency"]).casefold() != "daily"
+            or int(row["recurrence_interval"] or 0) != 1
+        ):
+            return
+        try:
+            base = datetime.fromisoformat(str(row["reminder_at"]))
+            if base.tzinfo is None or observed_at.tzinfo is None:
+                return
+            reference = observed_at.astimezone(base.tzinfo)
+            step = timedelta(days=1)
+            candidate = base + step
+            if candidate <= reference:
+                candidate += step * (((reference - candidate) // step) + 1)
+        except (TypeError, ValueError, OverflowError):
+            return
+
+        self._connection.execute(
+            "UPDATE reminders SET recurrence_active = 0 WHERE id = ?",
+            (int(row["id"]),),
+        )
+        reminder_text = candidate.isoformat()
+        existing = self._connection.execute(
+            "SELECT * FROM reminders WHERE task_id = ? AND reminder_at = ?",
+            (str(row["task_id"]), reminder_text),
+        ).fetchone()
+        if existing is not None:
+            # The task/time uniqueness boundary must never move a reminder to a
+            # different Weixin route. An existing same-route successor already
+            # advances this chain; a conflicting route safely stops this slot.
+            return
+        self._connection.execute(
+            """
+            INSERT INTO reminders(
+                task_id, title, category, project_id, platform, account_id,
+                user_id, chat_id, source_message_id, reminder_at, status,
+                next_attempt_at, recurrence_frequency, recurrence_interval,
+                recurrence_slot, recurrence_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'daily', 1, ?, 1)
+            """,
+            (
+                str(row["task_id"]),
+                str(row["title"]),
+                str(row["category"]),
+                str(row["project_id"]),
+                str(row["platform"]),
+                str(row["account_id"]),
+                str(row["user_id"]),
+                str(row["chat_id"]),
+                str(row["source_message_id"]),
+                reminder_text,
+                reminder_text,
+                str(row["recurrence_slot"]),
+            ),
         )
 
     def reminder_snapshot(self, task_id: str, message: MessageEnvelope) -> tuple[tuple[object, ...], ...]:
@@ -1190,12 +1294,37 @@ class IdempotencyLedger:
                     if unresolved:
                         raise ValueError("本次提醒正在发送或结果待确认，未取消其他次数")
                     eligible = eligible[:1]
+                else:
+                    # Stop rolling chains even when the current occurrence is
+                    # already sending and therefore cannot be recalled.
+                    self._connection.execute(
+                        """
+                        UPDATE reminders SET recurrence_active = 0
+                        WHERE task_id = ? AND platform = ? AND account_id = ?
+                          AND user_id = ? AND chat_id = ?
+                        """,
+                        (
+                            task_id,
+                            message.platform,
+                            message.account_id,
+                            message.user_id,
+                            message.chat_id,
+                        ),
+                    )
                 changed = 0
                 for row in eligible:
-                    changed += self._connection.execute(
+                    full_row = self._connection.execute(
+                        "SELECT * FROM reminders WHERE id = ?", (int(row[0]),)
+                    ).fetchone()
+                    cancelled = self._connection.execute(
                         "UPDATE reminders SET status = 'cancelled' WHERE id = ? AND status IN ('pending', 'failed', 'delivering')",
                         (row[0],),
                     ).rowcount
+                    changed += cancelled
+                    if scope == "next" and cancelled and full_row is not None:
+                        self._advance_daily_reminder_locked(
+                            full_row, message.received_at,
+                        )
                 self._connection.execute("COMMIT")
                 return changed, unresolved
             except BaseException:
@@ -1256,6 +1385,7 @@ class IdempotencyLedger:
         *,
         replace_existing: bool = False,
         expected_snapshot: tuple[tuple[object, ...], ...] | None = None,
+        recurrence: ReminderRecurrence | None = None,
     ) -> tuple[int, tuple[int, ...]]:
         """Atomically enqueue a finite reminder series.
 
@@ -1271,6 +1401,25 @@ class IdempotencyLedger:
             raise ValueError("提醒时间不能重复")
         if not task.task_id:
             raise ValueError("提醒缺少稳定 task_id")
+        rolling_daily = bool(
+            recurrence is not None
+            and str(recurrence.frequency).casefold() == "daily"
+            and recurrence.interval == 1
+            and recurrence.count == 0
+            and recurrence.weekday == 0
+            and recurrence.times
+        )
+        recurrence_frequency = "daily" if rolling_daily else ""
+        recurrence_interval = 1 if rolling_daily else 0
+        allowed_slots = set(recurrence.times) if rolling_daily and recurrence else set()
+        reminder_slots = tuple(
+            datetime.fromisoformat(item).strftime("%H:%M") for item in reminder_texts
+        )
+        if rolling_daily and (
+            len(allowed_slots) != len(recurrence.times)
+            or any(slot not in allowed_slots for slot in reminder_slots)
+        ):
+            raise ValueError("每天提醒的钟点与首次提醒不一致")
 
         route = (message.platform, message.account_id, message.user_id, message.chat_id)
         placeholders = ", ".join("?" for _ in reminder_texts)
@@ -1308,7 +1457,8 @@ class IdempotencyLedger:
                     ):
                         self._connection.execute(
                             f"""
-                            UPDATE reminders SET status = 'rescheduled'
+                            UPDATE reminders SET status = 'rescheduled',
+                                recurrence_active = 0
                             WHERE task_id = ?
                               AND platform = ? AND account_id = ?
                               AND user_id = ? AND chat_id = ?
@@ -1332,8 +1482,10 @@ class IdempotencyLedger:
                             INSERT INTO reminders(
                                 task_id, title, category, project_id, platform,
                                 account_id, user_id, chat_id, source_message_id,
-                                reminder_at, status, next_attempt_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                                reminder_at, status, next_attempt_at,
+                                recurrence_frequency, recurrence_interval,
+                                recurrence_slot, recurrence_active
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                             """,
                             (
                                 task.task_id,
@@ -1344,6 +1496,10 @@ class IdempotencyLedger:
                                 message.message_id,
                                 reminder_text,
                                 reminder_text,
+                                recurrence_frequency,
+                                recurrence_interval,
+                                reminder_slots[len(row_ids)],
+                                1 if rolling_daily else 0,
                             ),
                         )
                         changed += 1
@@ -1438,14 +1594,24 @@ class IdempotencyLedger:
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                self._connection.execute(
+                stale_rows = self._connection.execute(
                     """
-                    UPDATE reminders SET status = 'uncertain',
-                        last_error_code = 'delivery-outcome-unknown'
+                    SELECT * FROM reminders
                     WHERE status IN ('delivering', 'sending') AND last_attempt_at < ?
                     """,
                     (stale_before,),
-                )
+                ).fetchall()
+                for stale_row in stale_rows:
+                    changed = self._connection.execute(
+                        """
+                        UPDATE reminders SET status = 'uncertain',
+                            last_error_code = 'delivery-outcome-unknown'
+                        WHERE id = ? AND status IN ('delivering', 'sending')
+                        """,
+                        (int(stale_row["id"]),),
+                    ).rowcount
+                    if changed:
+                        self._advance_daily_reminder_locked(stale_row, now)
                 rows = self._connection.execute(
                     """
                     SELECT * FROM reminders
@@ -1492,15 +1658,32 @@ class IdempotencyLedger:
         self, row_ids: Iterable[int], delivered_at: datetime, delivered_message_id: str = ""
     ) -> None:
         with self._lock:
-            for row_id in row_ids:
-                self._connection.execute(
-                    """
-                    UPDATE reminders SET status = 'sent', delivered_at = ?,
-                        delivered_message_id = ?, last_error_code = ''
-                    WHERE id = ? AND status IN ('pending', 'failed', 'delivering', 'sending')
-                    """,
-                    (delivered_at.isoformat(), delivered_message_id[:300], int(row_id)),
-                )
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                for row_id in row_ids:
+                    row = self._connection.execute(
+                        "SELECT * FROM reminders WHERE id = ?", (int(row_id),)
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    changed = self._connection.execute(
+                        """
+                        UPDATE reminders SET status = 'sent', delivered_at = ?,
+                            delivered_message_id = ?, last_error_code = ''
+                        WHERE id = ? AND status IN ('pending', 'failed', 'delivering', 'sending')
+                        """,
+                        (
+                            delivered_at.isoformat(),
+                            delivered_message_id[:300],
+                            int(row_id),
+                        ),
+                    ).rowcount
+                    if changed:
+                        self._advance_daily_reminder_locked(row, delivered_at)
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
 
     def mark_reminders_failed(
         self,
@@ -1523,6 +1706,7 @@ class IdempotencyLedger:
         self,
         row_ids: Iterable[int],
         error_code: str = "delivery-outcome-unknown",
+        observed_at: datetime | None = None,
     ) -> None:
         """Record an ambiguous send result as terminal and never auto-retry it.
 
@@ -1542,15 +1726,29 @@ class IdempotencyLedger:
             }
             else "delivery-outcome-unknown"
         )
+        reference = observed_at or datetime.now(timezone.utc)
         with self._lock:
-            for row_id in row_ids:
-                self._connection.execute(
-                    """
-                    UPDATE reminders SET status = 'uncertain', last_error_code = ?
-                    WHERE id = ? AND status IN ('delivering', 'sending')
-                    """,
-                    (safe_code, int(row_id)),
-                )
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                for row_id in row_ids:
+                    row = self._connection.execute(
+                        "SELECT * FROM reminders WHERE id = ?", (int(row_id),)
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    changed = self._connection.execute(
+                        """
+                        UPDATE reminders SET status = 'uncertain', last_error_code = ?
+                        WHERE id = ? AND status IN ('delivering', 'sending')
+                        """,
+                        (safe_code, int(row_id)),
+                    ).rowcount
+                    if changed:
+                        self._advance_daily_reminder_locked(row, reference)
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
 
     def reminder_status(self, task_id: str, reminder_at: datetime) -> str | None:
         with self._lock:

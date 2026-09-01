@@ -31,7 +31,7 @@ DATE_TOKEN_RE = re.compile(
 CLOCK_TOKEN_RE = re.compile(
     rf"(?:(?<![A-Za-z{_NUMBER_CHARS}.])|"
     r"(?<=周[一二三四五六日天])|(?<=星期[一二三四五六日天])|(?<=礼拜[一二三四五六日天]))"
-    rf"(?<![{_NUMBER_CHARS}][:：])"
+    rf"(?<![{_NUMBER_CHARS}][:：.])"
     r"(?!(?<=周)[一二三四五六日天])"
     r"(?!(?<=星期)[一二三四五六日天])"
     r"(?!(?<=礼拜)[一二三四五六日天])"
@@ -42,6 +42,15 @@ CLOCK_TOKEN_RE = re.compile(
     r"(?:"
     rf"(?P<colon>[:：])\s*(?P<colon_minute>{_NUMBER})?(?:\s*分)?"
     rf"(?P<colon_seconds>[:：]\s*{_NUMBER}?)?"
+    r"|"
+    r"(?P<dot>(?<!\d{3})\.)\s*(?P<dot_minute>\d{2})"
+    r"(?(period)"
+    r"(?![\d./])"
+    r"|"
+    r"(?![\d./])(?=\s*(?:(?:的时候|时候)?\s*(?:提醒|通知|叫)\s*(?:一下\s*)?我|"
+    r"(?:[，,、]|以及|和|及|跟|与|或者|或)[^。；;！？!?\n]{0,24}"
+    r"(?:提醒|通知|叫)\s*(?:一下\s*)?我))"
+    r")"
     r"|"
     r"(?P<unit>点|时)"
     r"(?:"
@@ -156,8 +165,13 @@ def resolve_time(text: str, *, default_period: str = "") -> str:
     hour = _clock_number(match["hour"])
     if hour is None or not 0 <= hour <= 23:
         return ""
-    raw_minute = match["colon_minute"] if match["colon"] else match["minute"]
-    if match["colon"] and raw_minute is None:
+    separator = match["colon"] or match["dot"]
+    raw_minute = (
+        match["colon_minute"] if match["colon"] else
+        match["dot_minute"] if match["dot"] else
+        match["minute"]
+    )
+    if separator and raw_minute is None:
         return ""
     fraction = match["fraction"]
     if fraction:
@@ -173,7 +187,7 @@ def resolve_time(text: str, *, default_period: str = "") -> str:
     # reminder to "09:00" means 09:00, not an inherited 21:00. Inheritance is for
     # conversational "三点" / "四点半" only; an explicit period always applies.
     period = match["period"] or next(iter(periods), "") or (
-        default_period if not match["colon"] else ""
+        default_period if not separator else ""
     )
     if period and not PERIOD_TOKEN_RE.fullmatch(period):
         return ""

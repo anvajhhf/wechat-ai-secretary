@@ -39,12 +39,18 @@ class ClarificationReason(StrEnum):
 
 @dataclass(frozen=True)
 class ReminderRecurrence:
-    """A finite local Weixin reminder series, never a Dida recurrence rule."""
+    """A local Weixin reminder series, never a Dida recurrence rule.
+
+    Weekly rules are finite and use ``weekday``/``count``.  A daily rule is a
+    rolling local series: ``count`` and ``weekday`` are zero and ``times``
+    contains one or more unique ``HH:MM`` wall-clock slots.
+    """
 
     frequency: str = "weekly"
     interval: int = 1
     weekday: int = 0
     count: int = 0
+    times: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

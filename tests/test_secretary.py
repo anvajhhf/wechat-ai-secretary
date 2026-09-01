@@ -832,16 +832,15 @@ class MediaRoutingTests(unittest.TestCase):
             self.assertEqual(b"test-silk", source_stream.read())
             pcm.write(b"\x00\x00" * 480)
 
-        def fake_transcribe(audio_path: str, *, model: str) -> dict[str, object]:
-            self.assertEqual("small", model)
+        def fake_transcribe(audio_path: str | Path) -> str:
             prepared = Path(audio_path)
             self.assertTrue(prepared.is_file())
             self.assertEqual(".wav", prepared.suffix)
             observed_paths.append(prepared)
-            return {"success": True, "provider": "local", "transcript": "测试语音"}
+            return "测试语音"
 
         with patch("pysilk.decode", side_effect=fake_decode), patch(
-            "tools.transcription_tools.transcribe_audio_local_fallback",
+            "wechat_secretary.speech.LocalSpeechTranscriber.transcribe",
             side_effect=fake_transcribe,
         ):
             transcript, fingerprint = LocalMediaPreprocessor(cfg)._transcribe_audio(
@@ -854,9 +853,11 @@ class MediaRoutingTests(unittest.TestCase):
         self.assertFalse(observed_paths[0].exists())
         self.assertEqual([], list(cfg.media_work_dir.glob("voice-*.wav")))
 
+        from wechat_secretary.speech import SpeechTranscriptionError
+
         with patch("pysilk.decode", side_effect=fake_decode), patch(
-            "tools.transcription_tools.transcribe_audio_local_fallback",
-            return_value={"success": False, "provider": "local"},
+            "wechat_secretary.speech.LocalSpeechTranscriber.transcribe",
+            side_effect=SpeechTranscriptionError("本地语音转写失败"),
         ):
             with self.assertRaises(MediaPreparationError):
                 LocalMediaPreprocessor(cfg)._transcribe_audio(str(source))

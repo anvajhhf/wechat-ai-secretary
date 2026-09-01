@@ -9,6 +9,41 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
+_DEFAULT_ASR_VOCABULARY = ("试剂盒", "抗体", "流式", "分选", "询价", "ChatGPT", "B2M")
+
+
+def _asr_backend(value: object) -> str:
+    name = str(value if value is not None else "whisper").strip().lower()
+    if name not in {"whisper", "sensevoice", "paraformer"}:
+        raise ValueError("asr_backend 只支持 whisper、sensevoice 或 paraformer")
+    return name
+
+
+def _asr_threads(value: object) -> int:
+    if value is None:
+        return 2
+    if type(value) is not int or not 1 <= value <= 4:
+        raise ValueError("asr_threads 必须是1到4的整数")
+    return value
+
+
+def _asr_vocabulary(value: object) -> tuple[str, ...]:
+    if value is None:
+        return _DEFAULT_ASR_VOCABULARY
+    if not isinstance(value, list) or len(value) > 24:
+        raise ValueError("asr_vocabulary 必须是至多24个短词的列表")
+    terms: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not re.fullmatch(r"[\w .+-]{1,24}", item.strip()):
+            raise ValueError("asr_vocabulary 只接受短词，不接受句子或指令")
+        term = item.strip()
+        if term not in terms:
+            terms.append(term)
+    if sum(map(len, terms)) > 160:
+        raise ValueError("asr_vocabulary 总长度不能超过160字")
+    return tuple(terms)
+
+
 def _as_bool(value: object, default: bool = False) -> bool:
     if value is None:
         return default
@@ -71,8 +106,11 @@ class SecretarySettings:
     image_max_dimension: int = 2048
     audio_max_bytes: int = 25 * 1024 * 1024
     media_text_max_chars: int = 12000
+    asr_backend: str = "whisper"
+    asr_threads: int = 2
     asr_model: str = "small"
     asr_language: str = "zh"
+    asr_vocabulary: tuple[str, ...] = _DEFAULT_ASR_VOCABULARY
     web_enabled: bool = False
     web_max_urls: int = 1
     web_max_bytes: int = 2 * 1024 * 1024
@@ -279,7 +317,10 @@ class SecretarySettings:
                 1000, min(int(media.get("media_text_max_chars", 12000)), 30000)
             ),
             asr_model=str(media.get("asr_model", "small")).strip() or "small",
+            asr_backend=_asr_backend(media.get("asr_backend")),
+            asr_threads=_asr_threads(media.get("asr_threads")),
             asr_language=str(media.get("asr_language", "zh")).strip() or "zh",
+            asr_vocabulary=_asr_vocabulary(media.get("asr_vocabulary")),
             web_enabled=_as_bool(web.get("enabled"), False),
             web_max_urls=max(1, min(int(web.get("max_urls", 1)), 2)),
             web_max_bytes=max(

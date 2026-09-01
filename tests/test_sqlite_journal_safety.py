@@ -86,6 +86,64 @@ class SQLiteJournalSafetyTests(unittest.TestCase):
         self.assertEqual("fixture-generation", migrated.get_private_protection(message.sender_key))
         self.assertEqual((task,), migrated.pending_completion(message.conversation_key, NOW))
 
+    def test_legacy_reminder_table_gains_daily_columns_without_changing_rows(self):
+        path = self.root / "legacy-reminders.sqlite3"
+        legacy = sqlite3.connect(path, isolation_level=None)
+        try:
+            legacy.execute(
+                """
+                CREATE TABLE reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    project_id TEXT NOT NULL DEFAULT '',
+                    platform TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    source_message_id TEXT NOT NULL,
+                    reminder_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT NOT NULL,
+                    last_attempt_at TEXT NOT NULL DEFAULT '',
+                    delivered_at TEXT NOT NULL DEFAULT '',
+                    delivered_message_id TEXT NOT NULL DEFAULT '',
+                    last_error_code TEXT NOT NULL DEFAULT '',
+                    UNIQUE(task_id, reminder_at)
+                )
+                """
+            )
+            legacy.execute(
+                """
+                INSERT INTO reminders(
+                    task_id, title, platform, account_id, user_id, chat_id,
+                    source_message_id, reminder_at, status, next_attempt_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "legacy-task", "旧提醒", "weixin", "legacy-account",
+                    "legacy-user", "legacy-chat", "legacy-message",
+                    NOW.isoformat(), "pending", NOW.isoformat(),
+                ),
+            )
+        finally:
+            legacy.close()
+
+        migrated = self.ledger(path)
+        row = migrated._connection.execute(
+            """
+            SELECT task_id, status, recurrence_frequency,
+                   recurrence_interval, recurrence_slot, recurrence_active
+            FROM reminders WHERE task_id = 'legacy-task'
+            """
+        ).fetchone()
+
+        self.assertEqual(
+            ("legacy-task", "pending", "", 0, "", 0), tuple(row),
+        )
+
     def test_committed_wal_left_by_interrupted_writer_is_recovered_before_conversion(self):
         path = self.root / "interrupted-wal.sqlite3"
         message, task, _ = self.seed(path)

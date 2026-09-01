@@ -606,7 +606,10 @@ def register(ctx: Any) -> None:
             ),
             handler=lambda params, **kwargs: _json_tool_result(dida.taxonomy()),
         )
-        logger.info("Wechat secretary plugin ready (dry_run=%s)", settings.dry_run)
+        logger.info(
+            "Wechat secretary plugin ready (dry_run=%s, asr_backend=%s, asr_threads=%s)",
+            settings.dry_run, settings.asr_backend, settings.asr_threads,
+        )
     except BaseException as exc:
         logger.error("Wechat secretary initialization failed: %s", type(exc).__name__)
         allowed_users = settings.allowed_users if settings is not None else frozenset(

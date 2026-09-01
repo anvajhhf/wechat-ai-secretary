@@ -11,6 +11,7 @@ from uuid import uuid4
 from .config import SecretarySettings
 from .models import MessageEnvelope
 from .path_security import is_within_any
+from .speech import LocalSpeechTranscriber, SpeechTranscriptionError
 
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
@@ -43,6 +44,9 @@ class PreparedMedia:
     transcript_text: str = ""
     images: tuple[PreparedImage, ...] = ()
     fingerprints: tuple[str, ...] = ()
+    # Separate utterances let the privacy gate inspect each original prefix;
+    # display labels in transcript_text must never hide a later private input.
+    transcript_parts: tuple[str, ...] = ()
 
     @property
     def image_inputs(self) -> tuple[dict[str, object], ...]:
@@ -65,11 +69,12 @@ class LocalMediaPreprocessor:
 
     Images are decoded, metadata-stripped and resized in memory before being sent
     to the configured DeepSeek vision auxiliary task. Voice is transcribed only
-    through Hermes' already-installed local faster-whisper backend.
+    through the project's explicitly selected, already-cached local backend.
     """
 
     def __init__(self, settings: SecretarySettings):
         self.settings = settings
+        self.speech = LocalSpeechTranscriber(settings)
 
     def _safe_path(self, raw_path: str, *, max_bytes: int) -> tuple[Path, bytes, str]:
         candidate = Path(raw_path)
@@ -205,19 +210,9 @@ class LocalMediaPreprocessor:
                 prepared_path = temporary_audio
 
             try:
-                from tools.transcription_tools import transcribe_audio_local_fallback
-            except ImportError as exc:
-                raise MediaPreparationError("Hermes 本地语音组件不可用，语音未处理。") from exc
-            result = transcribe_audio_local_fallback(
-                str(prepared_path), model=self.settings.asr_model
-            )
-            if not result.get("success") or result.get("provider") != "local":
-                raise MediaPreparationError(
-                    "本地语音转写失败，语音没有发送给任何外部服务。"
-                )
-            transcript = str(result.get("transcript") or "").strip()
-            if not transcript:
-                raise MediaPreparationError("没有可靠识别到语音内容，请改发文字。")
+                transcript = self.speech.transcribe(prepared_path)
+            except SpeechTranscriptionError as exc:
+                raise MediaPreparationError(str(exc)) from exc
             return transcript, fingerprint
         except MediaPreparationError:
             raise
@@ -242,6 +237,7 @@ class LocalMediaPreprocessor:
 
         images: list[PreparedImage] = []
         transcripts: list[str] = []
+        transcript_parts: list[str] = []
         fingerprints: list[str] = []
         for index, raw_path in enumerate(message.media_paths, start=1):
             declared = (
@@ -258,6 +254,7 @@ class LocalMediaPreprocessor:
             if declared.startswith("audio/") or suffix in _AUDIO_SUFFIXES:
                 transcript, fingerprint = self._transcribe_audio(raw_path)
                 transcripts.append(f"[语音转写 {index}]\n{transcript}")
+                transcript_parts.append(transcript)
                 fingerprints.append(fingerprint)
                 continue
             raise MediaPreparationError("当前仅处理微信图片和语音；其他附件请补充文字说明。")
@@ -274,4 +271,5 @@ class LocalMediaPreprocessor:
             transcript_text=transcript_text,
             images=tuple(images),
             fingerprints=tuple(fingerprints),
+            transcript_parts=tuple(transcript_parts),
         )

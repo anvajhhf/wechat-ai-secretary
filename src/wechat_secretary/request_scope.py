@@ -74,6 +74,29 @@ _POLITE_REQUEST_LEAD = re.compile(
 _POLITE_REQUEST_END = re.compile(
     r"(?:可以|行|好|没问题)(?:吗|么)?\s*[?？]?\s*$"
 )
+_MODEL_FALLBACK_DIRECT_PREFIX = re.compile(
+    rf"^\s*(?:(?:{_POLITE_PREFIX}|记得|别忘(?:了)?|不要忘记|务必|一定|"
+    r"我想(?:请|让)你|(?:你\s*)?(?:能否|可否|能不能|可不可以|可以|能))"
+    r"\s*[，,、：:。.;；!！]*)*$"
+)
+_MODEL_FALLBACK_TEMPORAL_PREFIX = re.compile(
+    rf"^\s*(?:(?:{_POLITE_PREFIX}|记得|别忘(?:了)?|不要忘记|务必|一定|"
+    r"我想(?:请|让)你|(?:你\s*)?(?:能否|可否|能不能|可不可以|可以|能))"
+    r"\s*)*(?:从|自|在|到|于|等到|到了)?\s*"
+    r"(?:今天|今日|明天|明日|后天|大后天|每天|每日|每逢|每个|"
+    r"本周|这周|下周|下个(?:周|星期|礼拜)|(?:周|星期|礼拜)[一二三四五六日天]|"
+    r"工作日|周末|凌晨|早上|早晨|上午|中午|下午|傍晚|晚上|夜里|夜间|"
+    r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}\s*月\s*\d{1,2}\s*[日号]|"
+    r"\d{1,2}\s*(?:[:：.]\s*\d{1,2}|点|时)|(?:半|\d{1,3})\s*(?:分钟|小时)后)"
+)
+_MODEL_FALLBACK_REPORTED_PREFIX = re.compile(
+    r"(?:^|[，,。；;：:\s])(?:转发|示例|例如|原话|他说|她说|他们说|她们说|"
+    r"系统|助手|机器人|导师|老师|同事|朋友|家人)"
+    r"(?:会|将|说|表示|答应|负责|已经|刚才|刚刚|此前|曾经)?"
+)
+_MODEL_FALLBACK_QUESTION_PREFIX = re.compile(
+    r"(?:为什么|为何|怎么|如何|是否|是不是|会不会|有没有|什么时候|何时|几点|请问|我想知道)"
+)
 _REMINDER_STOP_INTENT = re.compile(
     r"(?:(?:不要|不用|无需|不必|不需要|请勿|别)"
     r"(?!\s*忘)[^，,。；;！？!?\n]{0,30}?(?:提醒|通知|叫)(?:\s*一下)?(?:\s*我)?|"
@@ -141,6 +164,46 @@ def reminder_marker(text: str) -> re.Match[str] | None:
                 return REMINDER_REQUEST_RE.match(candidate, connector.end() + outer.start())
         return None
     return REMINDER_REQUEST_RE.search(candidate) or _MEMORY_CUE_RE.search(candidate)
+
+
+def is_explicit_reminder_candidate(text: str) -> bool:
+    """Allow one constrained model fallback for a direct reminder request.
+
+    The strict parser remains the zero-token path.  This fallback covers
+    schedule wording that the parser does not yet understand (for example
+    ``从明天开始每天……``), but still requires an unquoted first-person
+    reminder marker and rejects reports, status questions and retractions.
+    It authorizes interpretation only; semantic grounding still decides
+    whether any task can be written.
+    """
+
+    if not text or note_request_match(text) is not None:
+        return False
+    candidate = mask_quoted_text(text)
+    marker = REMINDER_REQUEST_RE.search(candidate)
+    if marker is None or has_negated_reminder(text):
+        return False
+
+    prefix = candidate[:marker.start()]
+    payload = candidate[marker.end():]
+    if (
+        _MODEL_FALLBACK_REPORTED_PREFIX.search(prefix)
+        or _MODEL_FALLBACK_QUESTION_PREFIX.search(prefix)
+        or _REMINDER_BODY_META_QUESTION.search(payload)
+        or _REMINDER_STATUS_QUESTION.search(payload)
+    ):
+        return False
+    if (
+        _REMINDER_TRAILING_QUESTION.search(payload)
+        and not _POLITE_REQUEST_LEAD.search(candidate)
+        and not _POLITE_REQUEST_END.search(payload)
+    ):
+        return False
+
+    return bool(
+        _MODEL_FALLBACK_DIRECT_PREFIX.fullmatch(prefix)
+        or _MODEL_FALLBACK_TEMPORAL_PREFIX.match(prefix)
+    )
 
 
 def _schedule_prefix_matches(prefix: str) -> bool:

@@ -9,6 +9,8 @@ import re
 from dataclasses import dataclass
 from datetime import timedelta
 
+from .temporal import CLOCK_TOKEN_RE, DATE_TOKEN_RE, PERIOD_TOKEN_RE, RELATIVE_TOKEN_RE
+
 
 @dataclass(frozen=True)
 class ReminderAction:
@@ -32,14 +34,28 @@ def small_number(value: str) -> int:
     return digits.get(value, 0)
 
 
+def _temporal_fields_only(text: str) -> bool:
+    """A rejected/replacement field must not contain a task or a command."""
+    if not text or len(text) > 40:
+        return False
+    found = False
+    for pattern in (RELATIVE_TOKEN_RE, DATE_TOKEN_RE, CLOCK_TOKEN_RE, PERIOD_TOKEN_RE):
+        text, count = pattern.subn("", text)
+        found = found or count > 0
+    return found and not re.sub(r"的时候|时候|[，,、]", "", text)
+
+
 def parse_reminder_action(text: str) -> ReminderAction | None:
     text = re.sub(r"\s+", "", text).rstrip("。.!！")
     if re.search(r"[?？吗么“”\"「」『』]", text):
         return None
     text = re.sub(r"^(?:请|帮我|麻烦)", "", text)
-    correction = re.fullmatch(r"不是(?:今天|明天|后天)[，,]是((?:今天|明天|后天).*)", text)
-    if correction:
-        return ReminderAction("update", value=correction.group(1))
+    correction = re.fullmatch(r"(?:不对[，,]?)?不是(.+?)[，,]?(?:而是|是)(.+)", text)
+    if correction and all(_temporal_fields_only(part) for part in correction.groups()):
+        # No punctuation is required by the Chinese offline recognizer. Only
+        # the positive time fields reach the existing unique-context/snapshot
+        # checks; recurrence, cancellation and payload never enter this route.
+        return ReminderAction("update", value=correction.group(2))
     recent = r"(?:刚才|刚刚|上一个|最近)(?:的)?(?:那个|那条|这个)?"
     if re.fullmatch(rf"(?:{recent}|这个|这条)(?:提醒)?(?:不要了|不用了|取消了)", text):
         return ReminderAction("cancel")

@@ -17,6 +17,8 @@ dependencies = [
 media = [
   "faster-whisper>=1.2.1,<2",
   "silk-python>=0.2.8,<0.3",
+  "sherpa-onnx==1.13.6",
+  "sherpa-onnx-core==1.13.6",
 ]
 
 [project.scripts]

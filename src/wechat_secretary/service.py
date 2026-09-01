@@ -41,9 +41,14 @@ from .reminders import ReminderQueue
 from .reminder_actions import ReminderAction, parse_reminder_action, repeat_interval
 from .replies import format_failure, format_results
 from .routing import detect_route_hint
-from .request_scope import REMINDER_REQUEST_RE, mask_quoted_text
+from .request_scope import (
+    REMINDER_REQUEST_RE,
+    is_explicit_reminder_candidate,
+    mask_quoted_text,
+)
 from .semantic_guard import (
     is_pending_cancellation,
+    looks_like_pending_correction,
     looks_like_pending_followup,
     looks_like_pending_body,
     extract_task_semantics,
@@ -984,24 +989,29 @@ class SecretaryService:
 
         content = decision.content.strip()
         if prepared.transcript_text:
+            # Inspect the voice itself before adding any typed caption. A
+            # forced task/note prefix must not hide a spoken privacy request.
+            # Multi-voice wrappers are display text, not the prefix boundary
+            # of each original utterance. Inspect the in-memory parts instead.
+            voice_parts = prepared.transcript_parts or (prepared.transcript_text,)
+            if any(parse_prefix(part, speech=True).private for part in voice_parts):
+                self.ledger.finish(
+                    message,
+                    ExecutionStatus.SKIPPED,
+                    error_code="spoken-private-prefix-refused",
+                )
+                return HandlingResult(
+                    status=ExecutionStatus.SKIPPED,
+                    reply=(
+                        "本条只在本地完成了语音转写，没有发送给 DeepSeek，也没有写入任务或笔记。"
+                        "请先发送“私密：下一条”，再重发语音。"
+                    ),
+                )
             content = "\n\n".join(
                 part for part in (content, prepared.transcript_text) if part
             )
             if decision.forced_kind is None:
                 spoken_decision = parse_prefix(content, speech=True)
-                if spoken_decision.private:
-                    self.ledger.finish(
-                        message,
-                        ExecutionStatus.SKIPPED,
-                        error_code="spoken-private-prefix-refused",
-                    )
-                    return HandlingResult(
-                        status=ExecutionStatus.SKIPPED,
-                        reply=(
-                            "本条只在本地完成了语音转写，没有发送给 DeepSeek，也没有保存。"
-                            "请先发送“私密：下一条”，再重发语音。"
-                        ),
-                    )
                 if spoken_decision.forced_kind is not None:
                     decision = spoken_decision
                     content = spoken_decision.content.strip()
@@ -1061,13 +1071,37 @@ class SecretaryService:
             explicit_kind=decision.forced_kind,
             speech=bool(prepared.transcript_text),
         )
+        # The deterministic router is intentionally the cheap, high-confidence
+        # path.  If it cannot parse an otherwise direct reminder command, allow
+        # one compact task-only model call instead of returning a generic
+        # rejection.  The model still cannot authorize arbitrary writes: the
+        # source-grounding guard below owns the title, time and recurrence.
+        model_task_fallback = bool(
+            decision.forced_kind is None
+            and route_hint.kind is None
+            and is_explicit_reminder_candidate(content)
+        )
         pending_preview = self.ledger.peek_pending_task(message.conversation_key, now)
         pending_body = bool(pending_preview and pending_preview.reason is ClarificationReason.MISSING_TASK_BODY and looks_like_pending_body(content))
         pending_control = parse_reminder_action(content)
+        pending_append = bool(
+            pending_preview and pending_control and pending_control.kind == "append"
+        )
+        # A field-only correction such as "明天提醒我一次" belongs to the
+        # current draft, even if its reminder words also suggest a new task.
+        # Keep the existing atomic claim below: corrections do not bypass
+        # expiry, conversation boundaries, ordering, or uncertain executions.
+        pending_correction = bool(
+            pending_preview and looks_like_pending_correction(content)
+        )
         if (
             decision.forced_kind is None
-            and (route_hint.kind is None or (pending_preview and pending_control and pending_control.kind == "append"))
-            and (looks_like_pending_followup(content) or pending_body or bool(pending_preview and pending_control and pending_control.kind == "append"))
+            and not model_task_fallback
+            and (route_hint.kind is None or pending_append or pending_correction)
+            and (
+                looks_like_pending_followup(content) or pending_body
+                or pending_append or pending_correction
+            )
         ):
             pending_claim = self.ledger.claim_pending_task(
                 message.conversation_key,
@@ -1165,7 +1199,11 @@ class SecretaryService:
                         pending_claim.pending,
                     )
                 return handled
-        elif decision.forced_kind is not None or route_hint.kind is not None:
+        elif (
+            decision.forced_kind is not None
+            or route_hint.kind is not None
+            or model_task_fallback
+        ):
             self.ledger.abandon_pending_task(message.conversation_key)
 
         if decision.forced_kind is None and not prepared.images:
@@ -1176,7 +1214,7 @@ class SecretaryService:
             if reminder_at is not None:
                 return self._handle_relative_reminder(message, reminder_at, now)
         # A new, independent request ends a pending control clarification.
-        if route_hint.kind is not None:
+        if route_hint.kind is not None or model_task_fallback:
             self.ledger.clear_pending_reminder_action(message)
         if route_hint.kind is IntentKind.QUERY and "笔记" in content:
             return self._action_reply(message, "我识别到你想查询笔记，但当前还没有笔记检索接口；没有把它当成滴答任务查询。")
@@ -1253,6 +1291,8 @@ class SecretaryService:
             IntentKind.QUERY,
         }:
             classification_kind = route_hint.kind
+        if classification_kind is None and model_task_fallback:
+            classification_kind = IntentKind.TASK
         # Exact, source-grounded reminders do not need a generative extraction
         # round trip. The SAME semantic guard still validates every field and
         # retains incomplete drafts. Explicit categories/compound requests keep
@@ -1260,6 +1300,7 @@ class SecretaryService:
         local_guard = None
         if (
             classification_kind is IntentKind.TASK
+            and not model_task_fallback
             and not prepared.images and web_page is None and not decision.deep_note
             and len(REMINDER_REQUEST_RE.findall(mask_quoted_text(content))) == 1
             and not has_compound_reminder_body(content)
@@ -1271,6 +1312,7 @@ class SecretaryService:
                 local_guard = validate_plan_semantics(
                     content, IntentPlan(kind=IntentKind.TASK, confidence=1.0), now,
                     expected_kind=classification_kind,
+                    allow_daily=not bool(prepared.transcript_text),
                 )
         links = (
             self.obsidian.available_links(model_content)
@@ -1320,6 +1362,7 @@ class SecretaryService:
             expected_kind=classification_kind,
             allow_enriched_note=bool(web_page is not None or prepared.images),
             allow_explicit_task_fallback=decision.forced_kind is IntentKind.TASK,
+            allow_daily=not bool(prepared.transcript_text),
         )
         plan = guard.plan
         if not guard.ready or plan.kind is IntentKind.CLARIFY or plan.confidence < 0.55:
@@ -1352,6 +1395,17 @@ class SecretaryService:
                     "或“帮我记一下……”。"
                 )
                 reason = "ambiguous-intent"
+            if (
+                not guard.ready and classification_kind is IntentKind.TASK
+                and prepared.transcript_text and not prepared.images
+                and len(message.media_paths) == 1 and not message.text.strip()
+            ):
+                # Show only this voice's actual local transcript, never typed
+                # text or history. All private branches return before here.
+                heard = " ".join(prepared.transcript_text.split())
+                if heard:
+                    preview = heard[:80] + ("…" if len(heard) > 80 else "")
+                    question = f"我听到的是：{preview}\n{question}"
             self.ledger.finish(message, ExecutionStatus.SKIPPED, error_code=reason)
             return HandlingResult(
                 status=ExecutionStatus.SKIPPED,
