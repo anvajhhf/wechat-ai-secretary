@@ -14,15 +14,25 @@ from datetime import datetime, timedelta
 _NUMBER = r"(?:\d+|[零〇○一二两三四五六七八九十百千万亿]+)"
 _NUMBER_CHARS = r"\d零〇○一二两三四五六七八九十百千万亿"
 _APPROXIMATION = r"(?:大约|大概|大致|约莫|差不多|将近|接近|约)(?:\s*在)?"
-_PERIOD = r"凌晨|早上|早晨|上午|中午|下午|傍晚|晚上|夜里|夜间|午夜|半夜|深夜"
+_BASE_PERIOD = r"凌晨|早上|早晨|上午|中午|下午|傍晚|晚上|夜里|夜间|午夜|半夜|深夜"
+_COMPACT_DAY_PERIOD = r"今早|今晨|今晚|今夜|明早|明晨|明晚|明夜"
+_PERIOD = rf"{_COMPACT_DAY_PERIOD}|{_BASE_PERIOD}"
 _WEEKDAY = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
-_DAY_OFFSETS = {"今天": 0, "今日": 0, "明天": 1, "明日": 1, "后天": 2, "大后天": 3}
+_DAY_OFFSETS = {
+    "今天": 0, "今日": 0, "今早": 0, "今晨": 0, "今晚": 0, "今夜": 0,
+    "明天": 1, "明日": 1, "明早": 1, "明晨": 1, "明晚": 1, "明夜": 1,
+    "后天": 2, "大后天": 3,
+}
+_PERIOD_ALIASES = {
+    "今早": "早上", "今晨": "早晨", "今晚": "晚上", "今夜": "夜里",
+    "明早": "早上", "明晨": "早晨", "明晚": "晚上", "明夜": "夜里",
+}
 
 PERIOD_TOKEN_RE = re.compile(rf"(?:{_PERIOD})(?!茶)")
 DATE_TOKEN_RE = re.compile(
     rf"(?<![A-Za-z\d])\d{{4,}}[-/.]\d+[-/.]\d+(?!\d)|"
     rf"(?<![{_NUMBER_CHARS}])(?:{_NUMBER}年)?{_NUMBER}月{_NUMBER}(?:日|号)|"
-    r"大*后天|明天|明日|今天|今日|"
+    rf"{_COMPACT_DAY_PERIOD}|大*后天|明天|明日|今天|今日|"
     r"(?:下下|上上|下|上|本|这|这个)?(?:周|星期|礼拜)\s*[一二三四五六日天]"
 )
 
@@ -191,6 +201,7 @@ def resolve_time(text: str, *, default_period: str = "") -> str:
     )
     if period and not PERIOD_TOKEN_RE.fullmatch(period):
         return ""
+    period = _PERIOD_ALIASES.get(period, period)
     if period in {"晚上", "夜里", "夜间", "傍晚", "午夜", "半夜", "深夜"} and hour in {0, 12}:
         return ""
     if period in {"早上", "早晨", "上午"} and hour >= 12:

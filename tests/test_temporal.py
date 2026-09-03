@@ -51,6 +51,25 @@ class TemporalTests(unittest.TestCase):
         self.assertEqual(resolve_date("大后天", NOW.replace(month=12, day=30)), "2027-01-02")
         self.assertEqual(resolve_date("9月1号", NOW.replace(month=10)), "2026-09-01")
 
+    def test_compact_day_period_aliases_keep_both_date_and_period(self):
+        for text, expected_date, expected_time in (
+            ("今早八点", "2026-08-30", "08:00"),
+            ("今晨八点", "2026-08-30", "08:00"),
+            ("今晚七点半", "2026-08-30", "19:30"),
+            ("今夜十一点", "2026-08-30", "23:00"),
+            ("明早八点", "2026-08-31", "08:00"),
+            ("明晨八点", "2026-08-31", "08:00"),
+            ("明晚七点半", "2026-08-31", "19:30"),
+            ("明夜十一点", "2026-08-31", "23:00"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(expected_date, resolve_date(text, NOW))
+                self.assertEqual(expected_time, resolve_time(text))
+                self.assertEqual(
+                    f"{expected_date}T{expected_time}:00+08:00",
+                    resolve_datetime(text, NOW).isoformat(),
+                )
+
     def test_dates_reject_invalid_or_conflicting_candidates(self):
         for text in (
             "2月30号", "13月1日", "2026-02-29", "2026-13-01", "2026-9-999",

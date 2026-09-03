@@ -581,7 +581,7 @@ def extract_task_semantics(
     recurrence_start_explicit = bool(
         re.search(
             r"(?:20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}月\d{1,2}日|"
-            r"今天|明天|后天|(?:本周|这周|下周)[一二三四五六日天])",
+            r"今天|今早|今晨|今晚|今夜|明天|明早|明晨|明晚|明夜|后天|(?:本周|这周|下周)[一二三四五六日天])",
             schedule,
         )
     )
@@ -1760,7 +1760,7 @@ def _pending_explicit_start_date(text: str, resolved: str) -> str:
         return ""
     if re.search(
         r"20\d{2}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}月\d{1,2}日|"
-        r"今天|今日|明天|明日|后天|(?:本周|这周|下周)[一二三四五六日天]",
+        r"今天|今日|今早|今晨|今晚|今夜|明天|明日|明早|明晨|明晚|明夜|后天|(?:本周|这周|下周)[一二三四五六日天]",
         text,
     ):
         return resolved

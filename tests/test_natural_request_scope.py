@@ -46,6 +46,21 @@ class NaturalRequestScopeTests(unittest.TestCase):
                 self.assertFalse(is_non_action_task_utterance(text))
                 self.assertIs(detect_route_hint(text).kind, IntentKind.TASK)
 
+    def test_compact_day_period_reminders_route_without_weakening_boundaries(self) -> None:
+        for schedule in ("今早八点", "今晨八点", "今晚七点半", "今夜十一点", "明早八点", "明晨八点", "明晚七点半", "明夜十一点"):
+            text = f"{schedule}提醒我看申请书和文献"
+            with self.subTest(text=text):
+                self.assertIsNotNone(outer_reminder_match(text))
+                self.assertIs(detect_route_hint(text).kind, IntentKind.TASK)
+        for text in (
+            "她说今晚七点半提醒我看文献",
+            "不要今晚七点半提醒我看文献",
+            "今晚七点半提醒我看文献了吗？",
+            "“今晚七点半提醒我看文献”",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(detect_route_hint(text).kind)
+
     def test_front_loaded_action_is_owned_by_the_tail_reminder(self) -> None:
         for text in (
             "买牛奶，明天下午四点提醒我",

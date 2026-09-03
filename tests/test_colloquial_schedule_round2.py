@@ -41,6 +41,27 @@ class ColloquialScheduleTests(unittest.TestCase):
             self.assertEqual('看一下微信助手', dida.tasks[0].title)
             self.assertEqual(0, classifier.call_count)
 
+    def test_compact_tonight_request_creates_one_grounded_local_reminder(self):
+        reference = datetime(2026, 9, 3, 14, 23, tzinfo=fixtures.SETTINGS.tz)
+        body = '看一下师姐的申请书和导师发的文献'
+        for voice in (False, True):
+            with self.subTest(voice=voice):
+                service, classifier, media, dida, ledger = self.make_service()
+                incoming = replace(
+                    self.message(f'compact-tonight-{voice}', f'今晚七点半提醒我{body}', media, voice=voice),
+                    received_at=reference,
+                )
+
+                result = service.handle(incoming)
+
+                self.assertEqual(ExecutionStatus.PLANNED, result.status, result.reply)
+                self.assertEqual(0, classifier.call_count)
+                self.assertEqual(1, len(dida.tasks))
+                self.assertEqual(body, dida.tasks[0].title)
+                self.assertEqual('2026-09-03T19:30+08:00', dida.tasks[0].reminder_at)
+                self.assertTrue(dida.tasks[0].local_only_reminder)
+                self.assertEqual(1, ledger.active_reminder_count('voice-task-1', incoming))
+
     def test_tail_only_schedule_and_front_loaded_body_keep_clean_title(self):
         for text in (
             '提醒我看一下微信助手，今天下午4点半。',
