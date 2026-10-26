@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
 import inspect
 import json
 import logging
 import os
 import threading
+from contextlib import nullcontext
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +16,10 @@ from typing import Any
 from uuid import uuid4
 
 from .classifier import HermesStructuredClassifier
+from .chat import ChatStore, HermesChatResponder
+from .memory import MemoryStore, has_memory_state
+from .notes_search import NotesIndex
+from .notes_answer import HermesNotesResponder
 from .config import SecretarySettings, load_settings
 from .dida import DidaExecutor
 from .ledger import IdempotencyLedger
@@ -137,28 +143,45 @@ def _event_to_message(event: Any, settings: SecretarySettings) -> MessageEnvelop
     )
 
 
-def _schedule_reply(loop: asyncio.AbstractEventLoop, gateway: Any, event: Any, content: str) -> None:
+def _schedule_reply(loop: asyncio.AbstractEventLoop, gateway: Any, event: Any, content: str, *, before_send=None, delivery_guard=None) -> bool:
     if not content:
-        return
+        return False
     source = getattr(event, "source", None)
     platform = _platform_name(getattr(source, "platform", ""))
     adapter = _find_adapter(gateway, platform)
     chat_id = str(getattr(source, "chat_id", "") or "")
     if adapter is None or not chat_id or loop.is_closed():
         logger.warning("Secretary reply route unavailable for platform=%s", platform)
-        return
+        return False
     send_awaitable = None
     try:
         metadata = dict(getattr(event, "metadata", None) or {})
         thread_id = getattr(source, "thread_id", None)
         if thread_id is not None:
             metadata.setdefault("thread_id", thread_id)
-        send_awaitable = adapter.send(
-            chat_id=chat_id,
-            content=content,
-            reply_to=str(getattr(event, "message_id", "") or "") or None,
-            metadata=metadata or None,
-        )
+        if before_send is None:
+            send_awaitable = adapter.send(
+                chat_id=chat_id, content=content,
+                reply_to=str(getattr(event, "message_id", "") or "") or None,
+                metadata=metadata or None,
+            )
+        else:
+            async def checked_send():
+                # Revision validation happens on the event loop immediately
+                # before handing data to the adapter. No lock spans network
+                # waiting. Once handed over, a send is in flight and cannot
+                # be recalled by a later forget command.
+                with delivery_guard() if delivery_guard is not None else nullcontext():
+                    fresh_content = before_send()
+                    if not fresh_content:
+                        return {"success": False}
+                    awaitable = adapter.send(
+                        chat_id=chat_id, content=fresh_content,
+                        reply_to=str(getattr(event, "message_id", "") or "") or None,
+                        metadata=metadata or None,
+                    )
+                return await awaitable
+            send_awaitable = checked_send()
         try:
             future = asyncio.run_coroutine_threadsafe(send_awaitable, loop)
         except Exception:
@@ -166,12 +189,17 @@ def _schedule_reply(loop: asyncio.AbstractEventLoop, gateway: Any, event: Any, c
                 send_awaitable.close()
             raise
         result = future.result(timeout=30)
-        if hasattr(result, "success") and not bool(result.success):
-            logger.warning("Secretary reply delivery returned unsuccessful status")
-        if isinstance(result, dict) and (result.get("success") is False or result.get("error")):
-            logger.warning("Secretary reply delivery returned an error status")
+        confirmed = (
+            result.get("success") is True and not result.get("error")
+            if isinstance(result, dict) else
+            getattr(result, "success", None) is True and not getattr(result, "error", None)
+        )
+        if not confirmed:
+            logger.warning("Secretary reply delivery was not positively confirmed")
+        return confirmed
     except Exception as exc:
         logger.warning("Secretary reply delivery failed: %s", type(exc).__name__)
+        return False
 
 
 def _reminder_sender(
@@ -392,10 +420,29 @@ class GatewayBridge:
                         self._clear_private_protection(message.sender_key, protection_token)
                     elif not result.duplicate:
                         self._block_private(message.sender_key)
+                if result.memory_guarded or result.notes_guarded:
+                    result = self.service.prepare_reply_delivery(message, result)
                 reply = result.reply
                 if self.service.settings.dry_run:
                     reply = add_dry_run_previews(reply, result.results)
-                _schedule_reply(loop, gateway, event, reply)
+                if result.memory_guarded or result.notes_guarded:
+                    confirmed = _schedule_reply(
+                        loop, gateway, event, reply,
+                        before_send=lambda message=message, result=result: (
+                            result.reply if self.service.prepare_reply_delivery(message, result) is result else ""
+                        ),
+                        delivery_guard=lambda result=result: self.service.reply_delivery_guard(result),
+                    )
+                else:
+                    confirmed = _schedule_reply(loop, gateway, event, reply)
+                recorder = getattr(self.service, "record_reply_delivery", None)
+                if callable(recorder):
+                    try:
+                        recorder(message, result, confirmed=confirmed is True)
+                    except Exception as exc:
+                        # The message may already be delivered. Never enter
+                        # the worker's fallback-send path for a history fault.
+                        logger.warning("Secretary reply bookkeeping failed: %s", type(exc).__name__)
                 logger.info(
                     "Secretary handled ref=%s status=%s actions=%d",
                     ref,
@@ -516,8 +563,59 @@ def _tool_schema(name: str, description: str) -> dict[str, Any]:
     }
 
 
+def _start_chat_retention(store: ChatStore) -> None:
+    """Purge expired text hourly even without traffic, outside reminder locks."""
+    stop = threading.Event()
+
+    def maintain() -> None:
+        while not stop.wait(3600):
+            try:
+                store.purge()
+            except Exception as exc:
+                logger.warning("Secretary chat retention failed: %s", type(exc).__name__)
+
+    worker = threading.Thread(target=maintain, daemon=True, name="secretary-chat-retention")
+    worker.start()
+    # Stop before closing the database. A daemon blocked on sqlite is bounded
+    # by its connection timeout; do not hold up normal process shutdown.
+    atexit.register(stop.set)
+
+
+def _start_notes_scanner(index: NotesIndex, seconds: int):
+    stop, dirty = threading.Event(), threading.Event()
+    dirty.set()  # Initial indexing runs in the daemon, outside plugin registration.
+
+    def maintain():
+        while not stop.is_set():
+            dirty.wait(seconds)
+            dirty.clear()
+            if stop.is_set():
+                break
+            try:
+                index.scan()
+            except Exception as exc:
+                logger.warning("Secretary notes scan unavailable: %s", type(exc).__name__)
+
+    worker = threading.Thread(target=maintain, daemon=True, name="secretary-notes-scan")
+    worker.start()
+    def shutdown():
+        stop.set()
+        dirty.set()
+    atexit.register(shutdown)
+    return dirty.set
+
+
 def register(ctx: Any) -> None:
     """Hermes plugin registration. Configuration failures still install a deny-all hook."""
+    ctx.register_auxiliary_task(
+        "wechat_secretary_chat",
+        display_name="微信秘书日常聊天",
+        description="使用有限上下文聊天，不启用通用代理工具或自动记忆",
+        defaults={
+            "provider": "deepseek", "model": "deepseek-v4-flash",
+            "reasoning_effort": "none", "timeout": 60,
+        },
+    )
     ctx.register_auxiliary_task(
         "wechat_secretary_classifier",
         display_name="微信秘书分类器",
@@ -558,12 +656,56 @@ def register(ctx: Any) -> None:
         if config_errors:
             raise ValueError("; ".join(config_errors))
         ledger = IdempotencyLedger(settings.state_db_path)
+        chat_store = None
+        chat = None
+        if settings.chat_enabled or settings.assistant_db_path.exists():
+            try:
+                chat_store = ChatStore(settings.assistant_db_path, settings.chat_retention_days)
+                if settings.chat_enabled:
+                    chat = HermesChatResponder(ctx, settings)
+            except Exception as exc:
+                # Chat availability must not take down task/note processing
+                # or the reminder scheduler when its separate database fails.
+                logger.error("Secretary chat initialization failed: %s", type(exc).__name__)
+        memory_store = None
+        memory_unavailable = False
+        if settings.memory_enabled or settings.memory_guard_path.exists() or has_memory_state(settings.assistant_db_path):
+            try:
+                memory_store = MemoryStore(
+                    settings.assistant_db_path, guard_path=settings.memory_guard_path,
+                    max_entries=settings.memory_max_entries,
+                    max_entry_chars=settings.memory_max_entry_chars,
+                )
+                atexit.register(memory_store.close)
+            except Exception as exc:
+                memory_unavailable = True
+                logger.error("Secretary memory initialization failed: %s", type(exc).__name__)
         dida = DidaExecutor(
             settings,
             caller=lambda server, tool, arguments, timeout: ctx.call_mcp(
                 server, tool, arguments, timeout=timeout
             ),
         )
+        notes_index = None
+        notes_answer = None
+        notes_notify = None
+        if settings.notes_search_enabled or settings.notes_control_path.exists() or settings.notes_index_path.exists():
+            try:
+                if settings.vault_path is None or not settings.notes_allowed_paths:
+                    raise ValueError("notes-allowlist-required")
+                private_paths = settings.notes_private_paths + ((settings.private_inbox_path,) if settings.private_inbox_path else ())
+                notes_index = NotesIndex(settings.notes_index_path, vault_path=settings.vault_path,
+                                         allowed_paths=settings.notes_allowed_paths, private_paths=private_paths,
+                                         control_path=settings.notes_control_path)
+                atexit.register(notes_index.close)
+                if settings.notes_search_enabled:
+                    notes_answer = HermesNotesResponder(ctx, settings)
+                    try:
+                        notes_notify = _start_notes_scanner(notes_index, settings.notes_scan_seconds)
+                    except Exception as exc:
+                        logger.warning("Secretary notes scanner unavailable: %s", type(exc).__name__)
+            except Exception as exc:
+                logger.error("Secretary notes initialization failed: %s", type(exc).__name__)
         service = SecretaryService(
             settings=settings,
             ledger=ledger,
@@ -573,11 +715,23 @@ def register(ctx: Any) -> None:
             private_inbox=PrivateInboxExecutor(settings),
             media=LocalMediaPreprocessor(settings),
             web=SafeWebReader(settings),
+            chat=chat,
+            chat_store=chat_store,
+            memory_store=memory_store,
+            memory_unavailable=memory_unavailable,
+            notes_index=notes_index,
+            notes_answer=notes_answer,
+            notes_notify=notes_notify,
         )
         scheduler = ReminderScheduler(settings, ledger)
         bridge = GatewayBridge(service, scheduler)
         ctx.register_hook("gateway_ready", GatewayReadyBridge(scheduler))
         ctx.register_hook("pre_gateway_dispatch", bridge)
+        if chat_store is not None:
+            try:
+                _start_chat_retention(chat_store)
+            except Exception as exc:
+                logger.warning("Secretary chat retention worker unavailable: %s", type(exc).__name__)
 
         ctx.register_tool(
             name="secretary_morning_digest",

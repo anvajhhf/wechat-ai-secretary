@@ -64,6 +64,13 @@ class ReminderRouteConflictError(RuntimeError):
     """Refuse to move an existing reminder to a different delivery route."""
 
 
+# Reserved for locally generated chat/model/store/reset/focus failures. These
+# are terminal for one inbound ID; only a new user message may retry them.
+# Model output cannot supply ledger error codes. Other operation retries keep
+# their existing semantics, including private/note writes and task recovery.
+CHAT_FAILURE_PREFIX = "chat-"
+
+
 class IdempotencyLedger:
     """Durable local state without credentials or complete inbound message bodies.
 
@@ -178,6 +185,10 @@ class IdempotencyLedger:
                 );
                 CREATE INDEX IF NOT EXISTS idx_task_context_sender_time
                     ON task_context(sender_hash, observed_at DESC);
+                CREATE TABLE IF NOT EXISTS conversation_focus_resets (
+                    conversation_hash TEXT PRIMARY KEY,
+                    reset_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS pending_completion (
                     sender_hash TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
@@ -304,7 +315,7 @@ class IdempotencyLedger:
             try:
                 existing = self._connection.execute(
                     """
-                    SELECT state, content_hash FROM messages
+                    SELECT state, content_hash, last_error_code FROM messages
                     WHERE platform = ? AND account_id = ? AND message_id = ?
                     """,
                     message.identity_key,
@@ -315,7 +326,7 @@ class IdempotencyLedger:
                     retryable = matches and state in {
                         ExecutionStatus.FAILED.value,
                         ExecutionStatus.PARTIAL.value,
-                    }
+                    } and not str(existing["last_error_code"]).startswith(CHAT_FAILURE_PREFIX)
                     if retryable:
                         self._connection.execute(
                             """
@@ -566,6 +577,15 @@ class IdempotencyLedger:
         expires_at = observed_at + timedelta(seconds=ttl_seconds)
         sender_hash = self._hash(sender_key)
         with self._lock:
+            # A reminder may finish bookkeeping after a later chat response.
+            # Keep that older notification from reviving an anonymous target.
+            if context_kind == "reminder-delivery":
+                barrier = self._connection.execute(
+                    "SELECT reset_at FROM conversation_focus_resets WHERE conversation_hash = ?",
+                    (sender_hash,),
+                ).fetchone()
+                if barrier and observed_at <= datetime.fromisoformat(barrier["reset_at"]):
+                    context_kind = "inactive"
             for ref in refs:
                 if not ref.task_id or not ref.title:
                     continue
@@ -609,6 +629,37 @@ class IdempotencyLedger:
                     ),
                 )
 
+    def reset_conversation_focus(self, conversation_key: str, now: datetime) -> None:
+        """End anonymous references, without cancelling reminders or named tasks."""
+        key = self._hash(conversation_key)
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    "SELECT reset_at FROM conversation_focus_resets WHERE conversation_hash = ?",
+                    (key,),
+                ).fetchone()
+                cutoff = max(now, datetime.fromisoformat(row["reset_at"])) if row else now
+                self._connection.execute(
+                    "INSERT INTO conversation_focus_resets VALUES (?, ?) "
+                    "ON CONFLICT(conversation_hash) DO UPDATE SET reset_at=excluded.reset_at",
+                    (key, cutoff.isoformat()),
+                )
+                self._connection.execute(
+                    "UPDATE task_context SET context_kind = 'inactive' WHERE sender_hash = ?",
+                    (key,),
+                )
+                self._connection.execute("DELETE FROM pending_completion WHERE sender_hash = ?", (key,))
+                self._connection.execute(
+                    "DELETE FROM pending_task_clarifications WHERE conversation_hash = ? AND state = 'pending'",
+                    (key,),
+                )
+                self._connection.execute("DELETE FROM pending_reminder_actions WHERE conversation_hash = ?", (key,))
+                self._connection.execute("COMMIT")
+            except BaseException:
+                self._connection.execute("ROLLBACK")
+                raise
+
     @staticmethod
     def _row_to_ref(row: sqlite3.Row) -> TaskReference:
         return TaskReference(
@@ -624,13 +675,15 @@ class IdempotencyLedger:
         with self._lock:
             latest = self._connection.execute(
                 """
-                SELECT batch_id, observed_at, expires_at FROM task_context
+                SELECT batch_id, observed_at, expires_at, context_kind FROM task_context
                 WHERE sender_hash = ?
                 ORDER BY observed_at DESC, rowid DESC LIMIT 1
                 """,
                 (sender_hash,),
             ).fetchone()
             if latest is not None:
+                if latest["context_kind"] == "inactive":
+                    return ContextLookup(())
                 # A delayed inbound command must never operate on a task the
                 # sender had not yet seen. Do not fall back to an older task.
                 if not self._context_observed(latest["observed_at"], now):
@@ -1276,6 +1329,19 @@ class IdempotencyLedger:
                 (task_id, message.platform, message.account_id, message.user_id, message.chat_id),
             ).fetchall()
             return tuple(tuple(row) for row in rows)
+
+    def schedule_reminders(self, message: MessageEnvelope, *, limit: int = 2000) -> tuple[dict, ...]:
+        """Bounded read of this exact recipient/chat. No scheduler state changes."""
+        with self._lock:
+            rows = self._connection.execute(
+                """SELECT task_id, project_id, title, reminder_at, status,
+                          recurrence_frequency, recurrence_interval, recurrence_active
+                   FROM reminders WHERE platform=? AND account_id=? AND user_id=? AND chat_id=?
+                     AND status NOT IN ('cancelled', 'rescheduled')
+                   ORDER BY reminder_at DESC, id DESC LIMIT ?""",
+                (message.platform, message.account_id, message.user_id, message.chat_id, min(2000, max(1, limit)) + 1),
+            ).fetchall()
+            return tuple(dict(row) for row in rows)
 
     def cancel_reminders(self, task_id: str, message: MessageEnvelope, *, scope: str,
                          expected_snapshot: tuple[tuple[object, ...], ...]) -> tuple[int, bool]:

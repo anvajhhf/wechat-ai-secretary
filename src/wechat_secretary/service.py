@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
+import threading
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Callable
 
 from .classifier import Classifier
+from .chat import ChatStore, HermesChatResponder
+from .memory import MemoryCommand, MemoryStore, parse_memory_command
+from .notes_service import NotesServiceMixin
+from .notes_commands import parse_notes_command
+from .schedule import ScheduleSource, format_schedule, local_schedule, parse_schedule_query
 from .completion import (
     CompletionDecision,
     CompletionKind,
@@ -16,7 +24,7 @@ from .completion import (
 )
 from .config import SecretarySettings
 from .dida import DidaExecutor
-from .ledger import IdempotencyLedger
+from .ledger import CHAT_FAILURE_PREFIX, IdempotencyLedger
 from .media import (
     DisabledMediaPreprocessor,
     MediaPreparationError,
@@ -41,7 +49,7 @@ from .private_inbox import PrivateInboxExecutor
 from .reminders import ReminderQueue
 from .reminder_actions import ReminderAction, parse_reminder_action, repeat_interval
 from .replies import format_failure, format_results
-from .routing import detect_route_hint
+from .routing import detect_route_hint, is_explicit_chat_request, is_chat_style_followup
 from .request_scope import (
     REMINDER_REQUEST_RE,
     is_explicit_reminder_candidate,
@@ -72,9 +80,10 @@ from .web_reader import (
 
 _FAILED_OPERATION_REPLAY = "此前写操作失败；为避免重复，本次没有自动重试"
 _LOCAL_REMINDER_PROJECT_ID = "__wechat_secretary_local_reminder__"
+logger = logging.getLogger(__name__)
 
 
-class SecretaryService:
+class SecretaryService(NotesServiceMixin):
     def __init__(
         self,
         settings: SecretarySettings,
@@ -86,6 +95,13 @@ class SecretaryService:
         reminders: ReminderQueue | None = None,
         media: MediaPreprocessor | None = None,
         web: WebReader | None = None,
+        chat: HermesChatResponder | None = None,
+        chat_store: ChatStore | None = None,
+        memory_store: MemoryStore | None = None,
+        memory_unavailable: bool = False,
+        notes_index=None,
+        notes_answer=None,
+        notes_notify: Callable | None = None,
     ):
         self.settings = settings
         self.ledger = ledger
@@ -96,6 +112,285 @@ class SecretaryService:
         self.reminders = reminders or ReminderQueue(settings, ledger)
         self.media = media or DisabledMediaPreprocessor()
         self.web = web or DisabledWebReader()
+        self.chat = chat
+        self.chat_store = chat_store
+        self.memory_store = memory_store
+        self.memory_unavailable = memory_unavailable
+        self._init_notes(notes_index, notes_answer, notes_notify)
+        self._focus_recovery_lock = threading.Lock()
+        self._focus_recovery: set[str] = set()
+
+    def _handle_schedule(self, message: MessageEnvelope, query, now: datetime, *, images=False) -> HandlingResult:
+        self._clear_notes_focus(message.conversation_key)
+        try:
+            self.ledger.reset_conversation_focus(message.conversation_key, datetime.now(self.settings.tz))
+            if images or query.error or not self.settings.schedule_query_enabled or self.settings.dry_run:
+                reply = ("安排查询请单独发送文字或语音，图片不会作为查询条件。" if images else query.error
+                         or ("安排查询当前未开启。" if not self.settings.schedule_query_enabled else "Dry Run｜仅模拟安排查询，没有读取或修改真实任务和提醒。"))
+                self.ledger.finish(message, ExecutionStatus.SKIPPED)
+                return HandlingResult(status=ExecutionStatus.SKIPPED, reply=reply, chat_reset_focus=True)
+            try:
+                local = local_schedule(self.ledger.schedule_reminders(message), query, now)
+            except Exception as exc:
+                logger.warning("Secretary local schedule read failed: %s", type(exc).__name__)
+                local = ScheduleSource(available=False, problem="本地提醒暂时读取失败")
+            try:
+                dida = self.dida.schedule_tasks()
+                if not isinstance(dida, ScheduleSource):
+                    raise ValueError("invalid-schedule-source")
+            except Exception as exc:
+                logger.warning("Secretary Dida schedule read failed: %s", type(exc).__name__)
+                dida = ScheduleSource(available=False, problem="滴答待办暂时未查成功")
+            if not local.available and not dida.available:
+                status = ExecutionStatus.FAILED
+            elif not local.available or not dida.available or local.incomplete or dida.incomplete:
+                status = ExecutionStatus.PARTIAL
+            else:
+                status = ExecutionStatus.SUCCEEDED
+            reply = format_schedule(query, now, local, dida)
+            self.ledger.finish(message, status, error_code=CHAT_FAILURE_PREFIX + "schedule" if status is not ExecutionStatus.SUCCEEDED else "")
+            # A summary never supplies ordinal completion targets or chat/memory text.
+            return HandlingResult(status=status, reply=reply, chat_reset_focus=True)
+        except Exception as exc:
+            logger.warning("Secretary schedule unavailable: %s", type(exc).__name__)
+            self.ledger.finish(message, ExecutionStatus.FAILED, error_code=CHAT_FAILURE_PREFIX + "schedule-" + type(exc).__name__)
+            return HandlingResult(status=ExecutionStatus.FAILED, chat_reset_focus=True,
+                                  reply="这次安排查询没有完成，不能据此判断没有安排。现有任务、提醒和笔记没有改动。")
+
+    def _memory_control(self, message: MessageEnvelope, command: MemoryCommand, *, images: bool = False) -> HandlingResult:
+        """Local explicit commands; model output never enters this method."""
+        self._clear_notes_focus(message.conversation_key)
+        try:
+            self.ledger.reset_conversation_focus(message.conversation_key, datetime.now(self.settings.tz))
+            if images:
+                return self._action_reply(message, "记忆命令请单独发送文字；图片不会自动转成个人记忆。")
+            if command.error:
+                return self._action_reply(message, command.error)
+            if not self.settings.memory_enabled and command.action not in {"list", "forget"}:
+                return self._action_reply(message, "长期记忆当前未开启，没有保存或更正。现有聊天、提醒和笔记仍可使用。")
+            if self.memory_store is None:
+                return self._action_reply(message, "长期记忆当前不可用，未确认任何记忆操作。聊天、提醒和笔记仍可使用。")
+            if self.settings.dry_run and command.action != "list":
+                return self._action_reply(message, "Dry Run｜仅模拟这次记忆操作，没有实际保存、更正或删除记忆。")
+            outcome = self.memory_store.apply(message.conversation_key, message.message_id, command)
+            if outcome.duplicate:
+                reply = "这条记忆命令已处理过，没有重复执行。请发送“查看记忆”了解当前状态。"
+            elif outcome.status == "list":
+                entries = outcome.candidates
+                if not entries:
+                    reply = "当前没有符合条件的有效个人记忆。普通聊天不会自动成为长期记忆。"
+                else:
+                    lines = ["当前有效记忆："]
+                    for entry in entries[:10]:
+                        expiry = f"；有效至 {entry.expires_at}" if entry.expires_at else ""
+                        lines.append(f"{entry.memory_id}｜{entry.name or entry.kind}｜v{entry.version}\n{entry.content[:180]}{'…' if len(entry.content) > 180 else ''}{expiry}")
+                    if len(entries) > 10:
+                        lines.append("还有更多记忆，可用“查看记忆 关键词”筛选。")
+                    lines.append("更正：更正记忆 ID：新内容\n删除：忘记记忆 ID")
+                    reply = "\n".join(lines)
+            elif outcome.status in {"added", "updated"} and outcome.entry is not None:
+                verb = "记住" if outcome.status == "added" else "更正"
+                reply = f"已{verb} {outcome.entry.memory_id}（v{outcome.entry.version}）：{outcome.entry.content}\n已开始新的聊天上下文；提醒和原笔记保留。"
+            elif outcome.status == "forgotten":
+                reply = "已忘记指定记忆，并清理本会话保存的聊天上下文，防止旧回答重新带回它。已设提醒和原笔记保留，已发微信消息不会撤回。"
+            elif outcome.status in {"conflict", "ambiguous"}:
+                choices = "\n".join(f"{e.memory_id}：{e.content[:120]}" for e in outcome.candidates[:5])
+                reply = "存在同名或不唯一的记忆，这次没有改动。请用具体 ID 发送“更正记忆 ID：新内容”或“忘记记忆 ID”。" + ("\n" + choices if choices else "")
+            elif outcome.status == "not_found":
+                reply = "没有找到这条有效记忆，没有改动。可先发送“查看记忆”获取具体 ID。"
+            elif outcome.status == "duplicate":
+                reply = "这条内容已经记住，没有重复添加。可发送“查看记忆”确认。"
+            else:
+                reply = outcome.error or "这条记忆命令没有执行，请使用“记住：内容”“查看记忆”“更正记忆 ID：新内容”或“忘记记忆 ID”。"
+            self.ledger.finish(message, ExecutionStatus.SUCCEEDED)
+            return HandlingResult(status=ExecutionStatus.SUCCEEDED, reply=reply,
+                                  chat_reset_focus=True, memory_guarded=True, memory_revision=outcome.revision)
+        except Exception as exc:
+            logger.warning("Secretary memory command unavailable: %s", type(exc).__name__)
+            self.ledger.finish(message, ExecutionStatus.FAILED, error_code=f"{CHAT_FAILURE_PREFIX}memory-{type(exc).__name__}")
+            return HandlingResult(status=ExecutionStatus.FAILED, chat_reset_focus=True,
+                                  reply="这次没有确认记忆操作成功，请稍后查看记忆状态。现有提醒和笔记功能仍可使用。")
+
+    def prepare_reply_delivery(self, message: MessageEnvelope, result: HandlingResult) -> HandlingResult:
+        """Recheck at the actual adapter boundary, not only after generation."""
+        if result.notes_guarded:
+            try:
+                if not self._notes_is_current(message, result):
+                    raise ValueError("notes-context-changed")
+                if result.chat_generation and self.chat_store is not None and self.chat_store.get_generation(message.conversation_key) != result.chat_generation:
+                    raise ValueError("chat-context-changed")
+            except Exception as exc:
+                logger.warning("Secretary notes reply validation failed: %s", type(exc).__name__)
+                return HandlingResult(status=ExecutionStatus.SKIPPED, llm_called=result.llm_called,
+                                      chat_reset_focus=True,
+                                      reply="笔记来源或搜索上下文已变化，这条旧结果没有发送。请重新搜索。")
+        if not result.memory_guarded:
+            return result
+        try:
+            current = self.memory_store is not None and self.memory_store.is_current(
+                message.conversation_key, result.memory_revision,
+            )
+            if current and result.chat_generation:
+                current = self.chat_store is not None and self.chat_store.get_generation(message.conversation_key) == result.chat_generation
+            if current:
+                return result
+        except Exception as exc:
+            logger.warning("Secretary memory reply validation failed: %s", type(exc).__name__)
+        return HandlingResult(status=ExecutionStatus.SKIPPED, llm_called=result.llm_called,
+                              chat_reset_focus=True,
+                              reply="记忆或聊天上下文已变化，这条旧回答没有发送。请重新提问，我会使用当前可确认的信息。")
+
+    @contextmanager
+    def reply_delivery_guard(self, result: HandlingResult | None = None):
+        # Lock only this result's dependencies. Plain chat never waits for a scan.
+        # Combined dependencies acquire memory -> focus -> index, before network await.
+        with ExitStack() as stack:
+            if self.memory_store is not None and (result is None or result.memory_guarded):
+                stack.enter_context(self.memory_store.delivery_guard())
+            if result is not None and result.notes_guarded:
+                stack.enter_context(self._notes_lock)
+                if self.notes_index is not None:
+                    stack.enter_context(self.notes_index.delivery_guard())
+            yield
+
+    def _chat_reply(
+        self, message: MessageEnvelope, content: str, prepared: PreparedMedia,
+        *, temporary: bool = False,
+    ) -> HandlingResult:
+        called = False
+        self._clear_notes_focus(message.conversation_key)
+        try:
+            # A discussion must not accidentally answer an old task draft.
+            # This is durable even when chat is later switched off.
+            self.ledger.reset_conversation_focus(message.conversation_key, datetime.now(self.settings.tz))
+            if self.chat is None or self.chat_store is None:
+                raise RuntimeError("chat-unavailable")
+            if not content and not prepared.images:
+                return self._action_reply(message, "请在“聊天：”或“临时聊天：”后面写下想聊的内容。")
+            if len(content) > self.settings.chat_max_input_chars:
+                return self._action_reply(message, f"这条聊天内容太长，请分成每条不超过 {self.settings.chat_max_input_chars} 字的消息。")
+            memory_snapshot = None
+            memory_unavailable = self.memory_unavailable and not temporary
+            if not self.settings.memory_enabled and self.memory_store is not None and not temporary:
+                try:
+                    self.memory_store.current_revision(message.conversation_key)
+                except Exception:
+                    memory_unavailable = True
+            if self.settings.memory_enabled and not temporary:
+                try:
+                    if self.memory_store is None:
+                        raise RuntimeError("memory-unavailable")
+                    memory_snapshot = self.memory_store.snapshot(
+                        message.conversation_key, query=content,
+                        max_items=self.settings.memory_context_max_items,
+                        max_chars=self.settings.memory_context_max_chars,
+                    )
+                except Exception as exc:
+                    logger.warning("Secretary memory context unavailable: %s", type(exc).__name__)
+                    memory_unavailable = True
+            generation = self.chat_store.get_generation(message.conversation_key)
+            history = [] if temporary or memory_unavailable else self.chat_store.history(
+                message.conversation_key, self.settings.chat_max_rounds,
+                self.settings.chat_context_max_chars,
+                exclude_memory=not self.settings.memory_enabled,
+            )
+            called = True
+            extra = {"memories": memory_snapshot.entries} if memory_snapshot is not None else {}
+            reply = self.chat.respond(content, history, image_inputs=prepared.image_inputs, **extra)
+            if not isinstance(reply, str) or not reply.strip():
+                raise ValueError("empty-chat-reply")
+            self.ledger.finish(message, ExecutionStatus.SUCCEEDED)
+            return HandlingResult(
+                status=ExecutionStatus.SUCCEEDED,
+                reply=("记忆暂不可用，本轮只根据这条消息回答。\n" + reply if memory_unavailable else reply), llm_called=True,
+                chat_generation=generation,
+                # Original images/audio are never persisted in chat history.
+                chat_user_text="" if temporary or memory_unavailable else content or "[本轮用户发送了一张图片；图片未保留]",
+                chat_reset_focus=True,
+                memory_guarded=memory_snapshot is not None,
+                memory_revision=memory_snapshot.revision if memory_snapshot is not None else None,
+            )
+        except Exception as exc:
+            logger.warning("Secretary chat unavailable: %s", type(exc).__name__)
+            self.ledger.finish(message, ExecutionStatus.FAILED, error_code=f"{CHAT_FAILURE_PREFIX}{type(exc).__name__}")
+            return HandlingResult(
+                status=ExecutionStatus.FAILED,
+                reply="这次聊天暂时没有完成，请稍后用一条新消息重试。提醒和笔记功能仍按原有规则处理。",
+                llm_called=called, chat_reset_focus=True,
+            )
+
+    def _chat_control(self, message: MessageEnvelope, *, clear: bool) -> HandlingResult:
+        self._clear_notes_focus(message.conversation_key)
+        try:
+            self.ledger.reset_conversation_focus(message.conversation_key, datetime.now(self.settings.tz))
+            if self.chat_store is None:
+                raise RuntimeError("chat-store-unavailable")
+            self.chat_store.reset(message.conversation_key, clear=clear)
+            generation = self.chat_store.get_generation(message.conversation_key)
+            self.ledger.finish(message, ExecutionStatus.SUCCEEDED)
+            return HandlingResult(
+                status=ExecutionStatus.SUCCEEDED,
+                reply=("已清空本地保存的这段聊天，可以重新开始。已设提醒、原笔记和个人记忆保留。" if clear else
+                       "好的，开始新话题；接下来不再引用旧聊天。已设提醒、笔记和个人记忆保留。"),
+                chat_generation=generation, chat_reset_focus=True,
+            )
+        except Exception as exc:
+            self.ledger.finish(message, ExecutionStatus.FAILED, error_code=f"{CHAT_FAILURE_PREFIX}reset-{type(exc).__name__}")
+            return HandlingResult(status=ExecutionStatus.FAILED, reply="这次没有确认清理成功，请稍后重试。", chat_reset_focus=True)
+
+    def record_reply_delivery(
+        self, message: MessageEnvelope, result: HandlingResult, *, confirmed: bool,
+    ) -> None:
+        """Bookkeeping only: failure here must never trigger a second reply."""
+        if not confirmed or not result.chat_reset_focus:
+            return
+        try:
+            can_record = self.chat_store is not None
+            notes_valid = False
+            if result.notes_guarded:
+                can_record = False
+                try:
+                    if not self._notes_is_current(message, result):
+                        return
+                    notes_valid = True
+                except Exception as exc:
+                    logger.warning("Secretary delivered notes check failed: %s", type(exc).__name__)
+            if result.memory_guarded:
+                try:
+                    if self.memory_store is None:
+                        raise RuntimeError("memory-unavailable")
+                    if not self.memory_store.is_current(message.conversation_key, result.memory_revision):
+                        return
+                except Exception as exc:
+                    # Unknown memory state forbids storing text, but must not
+                    # skip phase-A's post-delivery task-focus safety barrier.
+                    can_record = False
+                    logger.warning("Secretary delivered memory check failed: %s", type(exc).__name__)
+            if result.chat_generation and self.chat_store is not None:
+                try:
+                    if self.chat_store.get_generation(message.conversation_key) != result.chat_generation:
+                        return
+                except Exception as exc:
+                    # Storage trouble cannot restore the task target hidden
+                    # by this delivered chat. Do not persist unverified text.
+                    can_record = False
+                    logger.warning("Secretary chat generation check failed: %s", type(exc).__name__)
+            try:
+                self.ledger.reset_conversation_focus(message.conversation_key, datetime.now(self.settings.tz))
+            except Exception:
+                with self._focus_recovery_lock:
+                    self._focus_recovery.add(message.conversation_key)
+                raise
+            if notes_valid:
+                self._notes_record_delivery(message, result)
+            if can_record and result.chat_generation and result.chat_user_text:
+                self.chat_store.record_sent(
+                    message.conversation_key, result.chat_generation,
+                    result.chat_user_text, result.reply, message_id=message.message_id,
+                    memory_context=result.memory_guarded,
+                )
+        except Exception as exc:
+            logger.warning("Secretary chat delivery bookkeeping failed: %s", type(exc).__name__)
 
     def accepts(self, message: MessageEnvelope) -> bool:
         if message.platform.casefold() != "weixin":
@@ -103,6 +398,21 @@ class SecretaryService:
         if self.settings.dm_only and message.chat_type not in {"dm", "private"}:
             return False
         return bool(message.user_id and message.user_id in self.settings.allowed_users)
+
+    def _has_chat_focus(self, message: MessageEnvelope, now: datetime) -> bool:
+        if self.chat_store is None:
+            return False
+        if (
+            self.ledger.recent_task_context(message.conversation_key, now).candidates
+            or self.ledger.peek_pending_task(message.conversation_key, now)
+            or self.ledger.pending_reminder_action(message)
+            or self.ledger.pending_completion(message.conversation_key, now)
+        ):
+            return False
+        try:
+            return bool(self.chat_store.history(message.conversation_key, 1, self.settings.chat_context_max_chars))
+        except Exception:
+            return False
 
     def _run_operation(
         self,
@@ -268,7 +578,27 @@ class SecretaryService:
         return replace(plan, kind=IntentKind.NOTE, tasks=(), query=None, notes=tuple(notes))
 
     def _local_help(self) -> str:
-        return (
+        memory_help = (
+            "长期记忆可用“记住：内容”“查看记忆”“更正记忆 ID：新内容”“忘记记忆 ID”。"
+            "普通聊天不会自动记住；保存、更正或忘记后会重新开始聊天上下文。\n"
+            if self.settings.memory_enabled else ""
+        )
+        chat_help = (
+            "也可以直接和我聊天、连续追问；“新话题”重置上下文，“清空这段对话”清理聊天，"
+            "“临时聊天：……”只聊当轮、不保存正文。\n"
+            if self.settings.chat_enabled else ""
+        )
+        notes_help = (
+            "笔记检索：搜索笔记：关键词 #标签；也可说“找一下上个月记的实验方案”。\n"
+            "收到结果后用“笔记问答：问题”或“第2条再详细说说”；“排除笔记 2”会排除整个来源文件，不删除原文。\n"
+            if self.settings.notes_search_enabled else ""
+        )
+        schedule_help = (
+            "安排查询：可直接问“今天有什么事”“本周有哪些提醒”“有没有没做完的”，或“安排查询：下周”。"
+            "合并本地提醒和滴答待办，仅查询，不修改安排。\n"
+            if self.settings.schedule_query_enabled else ""
+        )
+        return chat_help + memory_help + notes_help + schedule_help + (
             "我可以帮你创建待办、保存笔记、完成指定任务、设置提醒，以及读取公开链接。\n"
             "直接自然描述即可；例如“明天下午3点提醒我回电话”或“帮我记一下这个链接：网址”。\n"
             "有限重复提醒可以说“每周二上午9点提醒我买抗体，共3次”；缺少时间或次数时我会继续追问。\n"
@@ -788,6 +1118,11 @@ class SecretaryService:
                     lambda note=note: self.obsidian.save(note, message),
                 )
             )
+            if results[-1].status is ExecutionStatus.SUCCEEDED and self.notes_notify is not None:
+                try:
+                    self.notes_notify()
+                except Exception as exc:
+                    logger.warning("Secretary notes index notification failed: %s", type(exc).__name__)
         if plan.kind is IntentKind.QUERY and plan.query is not None:
             query_result = self._run_operation(
                 message,
@@ -1033,6 +1368,7 @@ class SecretaryService:
         decision = parse_prefix(message.text)
         now = message.received_at.astimezone(self.settings.tz)
         if decision.arm_private_next:
+            self._clear_notes_focus(message.conversation_key)
             self.ledger.arm_private_latch(
                 message.sender_key,
                 message.message_id,
@@ -1057,6 +1393,7 @@ class SecretaryService:
 
         latched_private = self.ledger.consume_private_latch(message.sender_key, now)
         if retrying_private or decision.private or latched_private:
+            self._clear_notes_focus(message.conversation_key)
             result = self._run_operation(
                 message,
                 "private_write:0",
@@ -1064,6 +1401,20 @@ class SecretaryService:
                 lambda: self.private_inbox.save(message),
             )
             return self._finalize(message, [result])
+
+        with self._focus_recovery_lock:
+            recover_focus = message.conversation_key in self._focus_recovery
+        if recover_focus:
+            try:
+                self.ledger.reset_conversation_focus(message.conversation_key, datetime.now(self.settings.tz))
+                with self._focus_recovery_lock:
+                    self._focus_recovery.discard(message.conversation_key)
+            except Exception as exc:
+                self.ledger.finish(message, ExecutionStatus.FAILED, error_code=f"{CHAT_FAILURE_PREFIX}focus-{type(exc).__name__}")
+                return HandlingResult(
+                    status=ExecutionStatus.FAILED,
+                    reply="当前会话的任务指代暂时无法安全确认，这条消息没有执行，请稍后重试。",
+                )
 
         prepared = PreparedMedia()
         if message.media_paths:
@@ -1100,6 +1451,7 @@ class SecretaryService:
             # of each original utterance. Inspect the in-memory parts instead.
             voice_parts = prepared.transcript_parts or (prepared.transcript_text,)
             if any(parse_prefix(part, speech=True).private for part in voice_parts):
+                self._clear_notes_focus(message.conversation_key)
                 self.ledger.finish(
                     message,
                     ExecutionStatus.SKIPPED,
@@ -1122,6 +1474,43 @@ class SecretaryService:
                     content = spoken_decision.content.strip()
                 else:
                     content = spoken_decision.content.strip()
+
+        if (self.settings.chat_enabled or self.chat_store is not None) and decision.forced_kind is None:
+            control = content.strip().rstrip("。！! ")
+            if not prepared.images and control in {"新话题", "换个话题", "清空这段对话", "清空对话"}:
+                return self._chat_control(message, clear=control.startswith("清空"))
+            explicit_chat = re.fullmatch(r"(临时聊天|聊天)\s*[：:]\s*(.*)", content, flags=re.DOTALL)
+            if explicit_chat and self.settings.chat_enabled:
+                return self._chat_reply(message, explicit_chat[2].strip(), prepared, temporary=explicit_chat[1] == "临时聊天")
+        if decision.forced_kind is None and not re.match(r"^(?:临时聊天|聊天)\s*[：:]", content):
+            memory_command = parse_memory_command(content, datetime.now(self.settings.tz))
+            if memory_command is not None:
+                return self._memory_control(message, memory_command, images=bool(prepared.images))
+            focus = self._notes_focus(message.conversation_key)
+            notes_command = parse_notes_command(content, now, has_focus=bool(focus and focus.snapshot is not None))
+            if notes_command is not None:
+                return self._handle_notes(message, notes_command, images=bool(prepared.images))
+            if self.settings.schedule_query_enabled or re.match(r"^(?:安排查询|查安排)\s*[：:]", content):
+                schedule_query = parse_schedule_query(content, now)
+                if schedule_query is not None:
+                    return self._handle_schedule(message, schedule_query, now, images=bool(prepared.images))
+        self._clear_notes_focus(message.conversation_key)
+        if (self.settings.chat_enabled or self.chat_store is not None) and decision.forced_kind is None:
+            preserve_link_note = decide_link_note(content, decision.forced_kind, decision.deep_note).mode in {
+                LinkNoteMode.NORMAL, LinkNoteMode.DEEP,
+            }
+            operation_route = detect_route_hint(content, speech=bool(prepared.transcript_text)).kind
+            preserve_operation = (
+                operation_route in {IntentKind.QUERY, IntentKind.NOTE, IntentKind.MIXED}
+                or parse_completion(content).kind is not CompletionKind.NONE
+                or parse_named_reminder(content, now) is not None
+                or parse_reminder_action(content) is not None
+            )
+            if self.settings.chat_enabled and not preserve_link_note and (
+                (not preserve_operation and is_explicit_chat_request(content))
+                or (is_chat_style_followup(content) and self._has_chat_focus(message, now))
+            ):
+                return self._chat_reply(message, content, prepared)
 
         if decision.forced_kind is None:
             completion = parse_completion(content)
@@ -1385,6 +1774,12 @@ class SecretaryService:
             model_content = self._web_model_content(content, web_page, now)
 
         classification_kind = decision.forced_kind
+        if (
+            self.settings.chat_enabled and classification_kind is None
+            and route_hint.kind is None and not model_task_fallback
+            and (content or not prepared.images)
+        ):
+            return self._chat_reply(message, content, prepared)
         if classification_kind is None and prepared.images and not content:
             # Sending an image by itself is an explicit request to capture its
             # contents, but it must never authorize an inferred external task.

@@ -326,7 +326,7 @@ class ReminderScheduler:
             (record.task for record in records),
             batch_id=batch_id, source_message_id=delivered_message_id or batch_id,
             observed_at=now, ttl_seconds=self.settings.completion_context_ttl_seconds,
-            context_kind="reminder", reminder_at=min(record.reminder_at for record in records),
+            context_kind="reminder-delivery", reminder_at=min(record.reminder_at for record in records),
         )
         self.ledger.record_task_context(
             sender_key,
@@ -335,7 +335,7 @@ class ReminderScheduler:
             source_message_id=delivered_message_id or batch_id,
             observed_at=now,
             ttl_seconds=self.settings.completion_context_ttl_seconds,
-            context_kind="reminder",
+            context_kind="reminder-delivery",
             reminder_at=min(record.reminder_at for record in records),
         )
 

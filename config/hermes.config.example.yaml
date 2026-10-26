@@ -7,6 +7,11 @@ model:
   default: "deepseek-v4-flash"
 
 auxiliary:
+  wechat_secretary_chat:
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
+    reasoning_effort: "none"
+    timeout: 60
   wechat_secretary_classifier:
     provider: "deepseek"
     model: "deepseek-v4-flash"

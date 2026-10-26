@@ -183,3 +183,13 @@ class HandlingResult:
     duplicate: bool = False
     llm_called: bool = False
     suppressed: bool = False
+    # In-memory only until the gateway explicitly confirms delivery.
+    chat_generation: str = ""
+    chat_user_text: str = ""
+    chat_reset_focus: bool = False
+    memory_revision: int | None = None
+    memory_guarded: bool = False
+    notes_guarded: bool = False
+    notes_snapshot: object | None = None
+    notes_context_id: str = ""
+    notes_activate: bool = False

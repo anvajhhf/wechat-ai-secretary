@@ -87,6 +87,24 @@ class SecretarySettings:
     timezone_name: str = "Asia/Shanghai"
     max_actions_per_message: int = 3
     worker_limit: int = 4
+    chat_enabled: bool = False
+    chat_retention_days: int = 7
+    chat_max_rounds: int = 10
+    chat_context_max_chars: int = 12000
+    chat_max_input_chars: int = 6000
+    chat_max_reply_chars: int = 4000
+    chat_max_tokens: int = 1200
+    memory_enabled: bool = False
+    memory_max_entries: int = 100
+    memory_max_entry_chars: int = 500
+    memory_context_max_items: int = 6
+    memory_context_max_chars: int = 2000
+    notes_search_enabled: bool = False
+    notes_allowed_paths: tuple[str, ...] = ()
+    notes_private_paths: tuple[Path, ...] = ()
+    notes_context_ttl_seconds: int = 600
+    notes_scan_seconds: int = 60
+    schedule_query_enabled: bool = False
     allowed_users: frozenset[str] = field(default_factory=frozenset)
     account_id: str = ""
     dm_only: bool = True
@@ -155,6 +173,24 @@ class SecretarySettings:
             / self.profile_id
             / "secretary.sqlite3"
         )
+
+    @property
+    def assistant_db_path(self) -> Path:
+        return self.state_db_path.with_name("assistant.sqlite3")
+
+    @property
+    def memory_guard_path(self) -> Path:
+        # Kept outside state/ so restoring assistant.sqlite3 cannot silently
+        # restore an obsolete deletion/revision watermark alongside it.
+        return self.project_root / "runtime" / "memory-control" / self.profile_id / "guard.json"
+
+    @property
+    def notes_index_path(self) -> Path:
+        return self.state_db_path.with_name("notes-index.sqlite3")
+
+    @property
+    def notes_control_path(self) -> Path:
+        return self.project_root / "runtime" / "notes-control" / self.profile_id / "control.json"
 
     @property
     def media_work_dir(self) -> Path:
@@ -248,6 +284,10 @@ class SecretarySettings:
         media = data.get("media", {})
         web = data.get("web", {})
         reminders = data.get("reminders", {})
+        chat = data.get("chat", {})
+        memory = data.get("memory", {})
+        notes_search = data.get("notes_search", {})
+        schedule_query = data.get("schedule_query", {})
         dida = data.get("dida", {})
 
         allowed_users = frozenset(
@@ -273,6 +313,24 @@ class SecretarySettings:
             timezone_name=str(secretary.get("timezone", "Asia/Shanghai")),
             max_actions_per_message=int(secretary.get("max_actions_per_message", 3)),
             worker_limit=max(1, min(int(secretary.get("worker_limit", 4)), 8)),
+            chat_enabled=_as_bool(chat.get("enabled"), False),
+            chat_retention_days=max(1, min(int(chat.get("retention_days", 7)), 30)),
+            chat_max_rounds=max(1, min(int(chat.get("max_rounds", 10)), 20)),
+            chat_context_max_chars=max(4000, min(int(chat.get("context_max_chars", 12000)), 30000)),
+            chat_max_input_chars=max(500, min(int(chat.get("max_input_chars", 6000)), 12000)),
+            chat_max_reply_chars=max(500, min(int(chat.get("max_reply_chars", 4000)), 8000)),
+            chat_max_tokens=max(256, min(int(chat.get("max_tokens", 1200)), 3000)),
+            memory_enabled=_as_bool(memory.get("enabled"), False),
+            memory_max_entries=max(1, min(int(memory.get("max_entries", 100)), 100)),
+            memory_max_entry_chars=max(50, min(int(memory.get("max_entry_chars", 500)), 1000)),
+            memory_context_max_items=max(1, min(int(memory.get("context_max_items", 6)), 6)),
+            memory_context_max_chars=max(200, min(int(memory.get("context_max_chars", 2000)), 2000)),
+            notes_search_enabled=_as_bool(notes_search.get("enabled"), False),
+            notes_allowed_paths=tuple(str(p) for p in notes_search.get("allowed_paths", []) if isinstance(p, str)),
+            notes_private_paths=tuple(p for item in notes_search.get("private_paths", []) if (p := _as_path(item, root)) is not None),
+            notes_context_ttl_seconds=max(60, min(int(notes_search.get("context_ttl_seconds", 600)), 1800)),
+            notes_scan_seconds=max(30, min(int(notes_search.get("scan_seconds", 60)), 600)),
+            schedule_query_enabled=_as_bool(schedule_query.get("enabled"), False),
             allowed_users=allowed_users,
             account_id=str(wechat.get("account_id", "")).strip(),
             dm_only=_as_bool(wechat.get("dm_only"), True),

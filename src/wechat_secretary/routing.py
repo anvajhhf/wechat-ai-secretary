@@ -151,6 +151,53 @@ def _unquoted_text(text: str) -> str:
     return mask_quoted_text(text)
 
 
+_CHAT_REQUEST = re.compile(
+    r"(?:(?:请|麻烦|劳驾|拜托)(?:你)?|帮(?:一下)?我|帮忙|替我|给我|为我|陪我|"
+    r"你|能否|可否|能不能|可不可以|可以|能|我想请你|我想让你|我想)(?:\s*)"
+)
+_CHAT_VERB = re.compile(
+    r"(?:写(?!下|入|到|进|成|个笔记|一[条篇个]笔记)|改写|润色|翻译|解释|分析|讨论|"
+    r"聊聊|聊一下|讲解|讲讲|比较|对比|总结|推荐|想想|理理思路)"
+)
+_CHAT_FEELING = re.compile(
+    r"(?:有点|有些|觉得|感觉|让我|令我).{0,8}(?:紧张|焦虑|担心|累|疲惫|烦|开心|难过|压力)|"
+    r"(?:很紧张|好紧张|很焦虑|压力(?:很|有点|太)?大|担心|心情(?:不好|不错|很差))"
+)
+
+
+def is_explicit_chat_request(text: str) -> bool:
+    """Recognize outer discussion, never a verb inside a reminder/note body.
+
+    This extra boundary is opt-in at the service. Bare temporal actions keep
+    their original routing when the user has not asked for discussion.
+    """
+    original = normalize_routing_text(text).text.strip()
+    if note_request_match(original) is not None or outer_reminder_match(original) is not None:
+        return False
+    candidate = mask_quoted_text(original)
+    if _EXPLICIT_TASK_CREATION.match(candidate) or _LEADING_ACTION_REQUEST.match(candidate):
+        return False
+    # Do not strip spaces introduced by masking a leading quotation: that
+    # would promote an inner/forwarded instruction to an outer request.
+    offset = 0
+    while prefix := _CHAT_REQUEST.match(candidate, offset):
+        offset = prefix.end()
+    if _CHAT_VERB.match(candidate, offset):
+        return True
+    return bool(_CHAT_FEELING.search(candidate))
+
+
+def is_chat_style_followup(text: str) -> bool:
+    """A bounded writing follow-up; time/recurrence changes stay in task flow."""
+    candidate = normalize_routing_text(text).text.strip()
+    return bool(re.fullmatch(
+        r"(?:请|帮我)?(?:把它|把这段|把刚才的回答)?(?:改成|改为|换成|调整成)"
+        r"(?:更|再)?(?:简洁|简短|详细|口语化|口语|正式|轻松|温柔|英文|英语|中文|汉语|日语|"
+        r"一段话|列表|表格)(?:一点|一些|点|的版本|版本|的风格|风格|的语气|语气)?[。！!]?",
+        candidate,
+    ))
+
+
 def _outer_reminder_match(text: str) -> re.Match[str] | None:
     return outer_reminder_match(text)
 

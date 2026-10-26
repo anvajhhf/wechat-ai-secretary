@@ -8,6 +8,7 @@ from threading import Lock
 from typing import Any, Callable
 
 from .config import SecretarySettings
+from .schedule import ScheduleSource, parse_dida_schedule
 from .models import (
     ActionResult,
     ExecutionStatus,
@@ -628,6 +629,16 @@ class DidaExecutor:
             external_id=external_id,
             task_refs=(reference,),
         )
+
+    def schedule_tasks(self) -> ScheduleSource:
+        """One read, no model or mutations; dates are filtered locally in Shanghai."""
+        if self.settings.dry_run:
+            return ScheduleSource(available=False, problem="模拟模式没有查询滴答")
+        try:
+            envelope = self._call("filter_tasks", {"filter": {"status": [0]}, "client_timezone": "Asia/Shanghai"}, timeout=20)
+            return parse_dida_schedule(envelope, self.settings.tz)
+        except Exception:
+            return ScheduleSource(available=False, problem="滴答连接或查询暂不可用")
 
     def query_tasks(self, query: TaskQuery) -> ActionResult:
         if self.settings.dry_run:
