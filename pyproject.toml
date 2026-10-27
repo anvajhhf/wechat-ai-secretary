@@ -18,7 +18,7 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only",
 ]
 dependencies = [
-  "Pillow>=11.3,<13",
+  "Pillow>=11.3,<14",
   "tzdata>=2025.3; sys_platform == 'win32'",
 ]
 
@@ -26,8 +26,8 @@ dependencies = [
 media = [
   "faster-whisper>=1.2.1,<2",
   "silk-python>=0.2.8,<0.3",
-  "sherpa-onnx==1.13.6",
-  "sherpa-onnx-core==1.13.6",
+  "sherpa-onnx==2.0.0",
+  "sherpa-onnx-core==2.0.0",
 ]
 
 [project.scripts]
